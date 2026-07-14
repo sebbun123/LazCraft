@@ -1,0 +1,2 @@
+# LazCraft
+All things Lazcraft

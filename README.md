@@ -9,7 +9,10 @@ The idea behind using LazCraft to level up a tradeskill is that you select a tra
 
 **Installation**
 
-Download the files. Place the Tradeskilllistener.Lua into your E3 Lua folder. The remaining files go into your Lua > LazCraft folder. If this is your first time using LazCraft, create a new folder and name it LazCraft.
+
+Download the files. Place the Tradeskilllistener.Lua into your E3 Lua folder. The remaining files go into your Lua > LazCraft folder. If this is your first time using LazCraft, create a new folder and name it LazCraft. 
+
+In-game: Type /lua run Lazcraft to start the Lua. Enjoy!
 
 **Crafting Tab**
 

@@ -208,7 +208,7 @@ local UI = {
 
 local state = {
     VERSION = '1.01',                              -- release version, shown in the title bar
-    BUILD_TAG = 'release-1.01-2026-07-19',            -- release marker (log header + Settings = stale-copy check)
+    BUILD_TAG = 'withdraw-recovery-retry-2026-07-19',            -- release marker (log header + Settings = stale-copy check)
     running = true,
     windowOpen = true,
     wasOpen = true,
@@ -1868,12 +1868,37 @@ end
 -- Inventory / item helpers
 -- ---------------------------------------------------------------------------
 
+-- Count only what's in BAGS, NOT worn/equipped slots. MacroQuest's FindItemCount includes equipped
+-- items AND the augments slotted into them, so an aug that shares a name with a tradeskill ingredient
+-- (e.g. "Bat Wings" the aug vs "Bat Wings" the TS item) would falsely inflate the count - the suite
+-- would think it already had the ingredient, skip the buy, then fail to place it (it's in your gear,
+-- not a bag). Tradeskill mats always live in bags, so bags-only is the correct scope. (Bank is
+-- counted separately via bank_count / the DanNet bank query.)
 local function item_count(name)
-    local ok, n = pcall(function()
-        return mq.TLO.FindItemCount('=' .. name)()
+    local target = (name or ''):lower()
+    local total = 0
+    local ok = pcall(function()
+        for pk = 1, 12 do
+            local slot = mq.TLO.Me.Inventory('pack' .. pk)
+            if (slot.ID() or 0) > 0 then
+                local cap = slot.Container() or 0
+                if cap > 0 then                              -- a bag: count its contents
+                    for i = 1, cap do
+                        local it = slot.Item(i)
+                        if (it.ID() or 0) > 0 and (it.Name() or ''):lower() == target then
+                            local n = it.Stack() or 1
+                            total = total + (n < 1 and 1 or n)
+                        end
+                    end
+                elseif (slot.Name() or ''):lower() == target then   -- a plain item directly in an inventory slot
+                    local n = slot.Stack() or 1
+                    total = total + (n < 1 and 1 or n)
+                end
+            end
+        end
     end)
-    if not ok or type(n) ~= 'number' then return 0 end
-    return n
+    if not ok then return 0 end
+    return total
 end
 
 -- How many full combines the on-hand dropped mats can support for this recipe.
@@ -11057,6 +11082,7 @@ state.withdraw_count = function(name, n)
     -- window; the KEY is setting the amount via the TLO SetText method (NOT /notify settext, which is
     -- an invalid notification) - that was the "pulled the whole stack" bug all along.
     local grabbedStack = 0   -- the grabbed slot's stack size (set by grab), decides split handling
+    local grabbedBag, grabbedSlot = 0, 0   -- nested bank bag + slot we grabbed from (for closed-bag recovery)
     local function grab()
         for b = 1, 24 do
             local bag = mq.TLO.Me.Bank(b)
@@ -11069,12 +11095,14 @@ state.withdraw_count = function(name, n)
                             -- (bag open). A whole-stack pull, or a non-stackable (Stack()==1), grabs
                             -- straight from a closed bag.
                             grabbedStack = bag.Item(sidx).Stack() or 1
+                            grabbedBag, grabbedSlot = b, sidx
                             if n < grabbedStack then state.ensure_bank_bag_open(b) end   -- partial opens; whole leaves the bag as-is
                             mq.cmdf('/itemnotify in bank%d %d leftmouseup', b, sidx); return true
                         end
                     end
                 elseif (bag.Name() or ''):upper() == upper then
                     grabbedStack = bag.Stack() or 1
+                    grabbedBag, grabbedSlot = 0, 0
                     mq.cmdf('/itemnotify bank%d leftmouseup', b); return true
                 end
             end
@@ -11095,6 +11123,30 @@ state.withdraw_count = function(name, n)
         grab()
         mq.delay(800, function() return mq.TLO.Window('QuantityWnd').Open() or (mq.TLO.Cursor.ID() or 0) > 0 end)
     end
+    -- CLOSED-BAG RECOVERY: partial wanted but no split popped and we grabbed the WHOLE stack -> the bag was
+    -- closed (an ensure_bank_bag_open toggle shut an already-open bag). Put the stack back, force the bag
+    -- open, and regrab so the split pops. One toggle doesn't always land, so try up to 3 times. Fires only
+    -- on this exact symptom, so a normal partial pays nothing; without it we'd stow the whole stack.
+    for attempt = 1, 3 do
+        if not (n < grabbedStack and grabbedBag > 0 and not mq.TLO.Window('QuantityWnd').Open()
+                and (mq.TLO.Cursor.ID() or 0) > 0) then break end
+        printf_log('  partial split did not pop (bag closed) - returning stack, reopening bag, regrab %d...', attempt)
+        mq.cmdf('/itemnotify in bank%d %d leftmouseup', grabbedBag, grabbedSlot)   -- deposit the stack back
+        mq.delay(500, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+        state.bank_bag_opened[grabbedBag] = nil                                    -- clear cache so we TRULY reopen
+        state.ensure_bank_bag_open(grabbedBag)
+        grab()
+        mq.delay(800, function() return mq.TLO.Window('QuantityWnd').Open() or (mq.TLO.Cursor.ID() or 0) > 0 end)
+    end
+    -- Fail-safe: if the split STILL never popped and we're holding the whole stack, return it to the bank
+    -- and bail (0) rather than stow it - never over-pull.
+    if n < grabbedStack and grabbedBag > 0 and not mq.TLO.Window('QuantityWnd').Open()
+       and (mq.TLO.Cursor.ID() or 0) > 0 then
+        mq.cmdf('/itemnotify in bank%d %d leftmouseup', grabbedBag, grabbedSlot)
+        mq.delay(500, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+        printf_log('Bank: could not open bag to split %s after retries - skipping (no over-pull).', name)
+        return 0
+    end
     if mq.TLO.Window('QuantityWnd').Open() then
       if n >= grabbedStack then
         -- WHOLE stack: accept the split's DEFAULT (the full stack), the way TurboGive's
@@ -11108,16 +11160,18 @@ state.withdraw_count = function(name, n)
         -- text read; only re-issue occasionally if it hasn't committed. The extra /invoke calls were
         -- the slow part.
         local want = tostring(n)
-        local set = false
-        mq.cmdf('/invoke ${Window[QuantityWnd/QTYW_SliderInput].SetText[%d]}', n)
-        local deadline, ticks = mq.gettime() + 1200, 0
+        local set  = false
+        local fld  = mq.TLO.Window('QuantityWnd/QTYW_SliderInput')
+        -- Direct TLO setter (fast, one-shot). Safe now that the closed-bag recovery above guarantees the
+        -- split window is really open before we set the amount - the earlier over-pull was a whole-stack
+        -- grab with NO split getting stowed, not the setter itself.
+        fld.SetText(want)()
+        local deadline, ticks = mq.gettime() + 1000, 0
         repeat
-            if (mq.TLO.Window('QuantityWnd/QTYW_SliderInput').Text() or '') == want then set = true; break end
-            mq.delay(25)
+            if (fld.Text() or '') == want then set = true; break end
+            mq.delay(20)
             ticks = ticks + 1
-            if ticks % 6 == 0 then   -- ~every 150ms, nudge it again if it hasn't taken
-                mq.cmdf('/invoke ${Window[QuantityWnd/QTYW_SliderInput].SetText[%d]}', n)
-            end
+            if ticks % 8 == 0 then fld.SetText(want)() end   -- re-issue occasionally if it hasn't stuck
         until mq.gettime() > deadline
         if not set then
             printf_log('Bank: could not set qty to %d for %s (reads %s) - cancelling to avoid over-pull.',
@@ -11130,15 +11184,17 @@ state.withdraw_count = function(name, n)
         mq.delay(500, function() return (mq.TLO.Cursor.ID() or 0) > 0 end)
       end
     end
+    -- Stow the grab: /autoinventory, then poll the cursor tightly and re-fire every 100ms if the first
+    -- fire didn't take (it often no-ops for a beat right after the split accept). Clears the instant it stows.
     if (mq.TLO.Cursor.ID() or 0) > 0 then
         mq.cmd('/autoinventory')
-        mq.delay(300, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-    end
-    -- Plain cursor top-up, NOT the full clear_cursor: its stacked-desync settle adds a fixed 2s meant
-    -- for rapid salvage stows, not a single clean bank withdraw. The /autoinventory above already
-    -- emptied the cursor in the common case; this just catches a straggler cheaply.
-    if (mq.TLO.Cursor.ID() or 0) > 0 then
-        mq.cmd('/autoinventory'); mq.delay(600, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+        local t0, lastFire = mq.gettime(), mq.gettime()
+        while (mq.TLO.Cursor.ID() or 0) > 0 and (mq.gettime() - t0) < 1500 do
+            mq.delay(10)
+            if (mq.TLO.Cursor.ID() or 0) > 0 and (mq.gettime() - lastFire) > 100 then
+                mq.cmd('/autoinventory'); lastFire = mq.gettime()
+            end
+        end
     end
     local got = item_count(name) - before
     printf_log('Withdrew %d x %s (asked %d).', got, name, n)
@@ -15403,6 +15459,36 @@ mq.bind('/laztestbank', function(a1, a2, a3)
     mq.cmd('/notify BigBankWnd DoneButton leftmouseup')
     printf_log('=== SUMMARY: %d round(s) | [a] partial %d/%d | [b] whole %d/%d | [c] trophy %d/%d | avg round %dms ===',
         rounds, pa, rounds, pb, rounds, pc, rounds, (rounds > 0) and math.floor(tTotal / rounds) or 0)
+end)
+
+-- TEST: mirror of the listener's /ts_wtest so the crafter's withdraw is measured the SAME way -
+-- repeated partial withdraw_count(item, count), score + time each round, no whole/trophy/deposit noise.
+-- Usage on the crafter: /laztestwd <item> <count> [rounds]   e.g.  /laztestwd Glass Shard 5 10
+mq.bind('/laztestwd', function(...)
+    local args = { ... }
+    if #args < 2 then printf_log('usage: /laztestwd <item> <count> [rounds]'); return end
+    local rounds = 1
+    if #args >= 3 and tonumber(args[#args]) and tonumber(args[#args - 1]) then
+        rounds = math.max(1, math.floor(tonumber(args[#args]))); args[#args] = nil
+    end
+    local count = tonumber(args[#args]); args[#args] = nil
+    if not count then printf_log('/laztestwd: expected a number for <count>'); return end
+    count = math.max(1, math.floor(count))
+    local item = table.concat(args, ' ')
+    printf_log('/laztestwd: %s x%d - %d round(s)...', item, count, rounds)
+    local passes, tsum = 0, 0
+    for r = 1, rounds do
+        local t0  = mq.gettime()
+        local got = state.withdraw_count(item, count)   -- self-opens the bank; stow probe logs inside
+        local dt  = mq.gettime() - t0
+        tsum = tsum + dt
+        local inBags = item_count(item)
+        local ok = (got == count) and (inBags >= count)
+        if ok then passes = passes + 1 end
+        printf_log('  round %d/%d %s: withdrew %d, %d in bags (asked %d) in %dms - %s',
+            r, rounds, item, got, inBags, count, dt, ok and 'PASS' or 'FAIL')
+    end
+    printf_log('/laztestwd: %d/%d PASS, avg %dms.', passes, rounds, (rounds > 0) and math.floor(tsum / rounds) or 0)
 end)
 
 pcall(function() mq.bind('/lazbank', function(action, ...)

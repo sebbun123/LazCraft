@@ -80,9 +80,7 @@ end
 local function trim(s) return s:match('^%s*(.-)%s*$') end
 
 local function decode(s)
-    -- Reverse the crafter's encode(): apostrophe sentinel back to "'", underscores
-    -- back to spaces. (The old trailing-apostrophe strip was a band-aid for the
-    -- unencoded-apostrophe bug and is no longer needed.)
+    -- Reverse the crafter's encode(): apostrophe sentinel back to "'", underscores back to spaces.
     s = tostring(s or '')
     s = s:gsub('XAPOSX', "'")
     s = s:gsub('_', ' ')
@@ -147,7 +145,50 @@ local function clear_marr_zonein()
     mq.cmd('/nav stop'); mq.delay(200)
 end
 
+local POK_BANK_STAGE   = '439.07 476.58 -122.08'   -- /nav loc spot that opens Ceridan or Granger
+local POK_STAGE_BANKER = { ['banker ceridan'] = true, ['banker granger'] = true }
+-- PoK has three bankers. Dogle Pitt paths cleanly - /nav id straight onto him. Banker Ceridan and
+-- Banker Granger cluster on the lower tier and WEDGE if you /nav id onto them, but a /nav loc to the
+-- staging spot above drops you in open-range of both. Pick whichever of the three is nearest (least
+-- travel, 3D so the tier gap counts) and use the matching approach. Non-PoK: nearest banker + /nav id.
 local function nav_to_banker()
+    if (mq.TLO.Zone.ShortName() or '') == 'poknowledge' then
+        local who, whod
+        for _, n in ipairs({ 'Dogle Pitt', 'Banker Ceridan', 'Banker Granger' }) do
+            local d = mq.TLO.Spawn(n).Distance3D()
+            if d and d > 0 and (not whod or d < whod) then who, whod = n, d end
+        end
+        if not who then log('No PoK banker in range.'); return false end
+        mq.cmdf('/target %s', who)
+        mq.delay(500, function() return (mq.TLO.Target.ID() or 0) > 0 end)
+        if (mq.TLO.Target.ID() or 0) == 0 then log('Could not target %s.', who); return false end
+        if POK_STAGE_BANKER[(who):lower()] then
+            -- staging approach: nav to the spot, then we are in open/right-click range of the banker
+            mq.cmdf('/nav loc %s', POK_BANK_STAGE)
+            mq.delay(1000, function() return mq.TLO.Navigation.Active() end)
+            local deadline = mq.gettime() + 15000
+            while mq.gettime() < deadline do
+                if not mq.TLO.Navigation.Active() then break end
+                mq.doevents(); mq.delay(100)
+            end
+            mq.cmdf('/target %s', who)   -- re-grab in case nav jostled the target
+            mq.delay(300, function() return (mq.TLO.Target.ID() or 0) > 0 end)
+            return (mq.TLO.Target.Distance() or 999) <= 25   -- openable from the stage
+        end
+        -- Dogle Pitt: clean straight nav.
+        if (mq.TLO.Target.Distance() or 999) > 10 then
+            mq.cmdf('/nav id %d', mq.TLO.Target.ID())
+            mq.delay(1000, function() return mq.TLO.Navigation.Active() end)
+            local deadline = mq.gettime() + 15000
+            while mq.gettime() < deadline do
+                if not mq.TLO.Navigation.Active() then break end
+                mq.doevents(); mq.delay(100)
+            end
+        end
+        return (mq.TLO.Target.Distance() or 999) <= 10
+    end
+
+    -- Non-PoK: nearest banker, straight nav (unchanged).
     mq.cmd('/target npc banker')
     mq.delay(500, function() return (mq.TLO.Target.ID() or 0) > 0 end)
     if (mq.TLO.Target.ID() or 0) == 0 then
@@ -169,11 +210,20 @@ local function nav_to_banker()
     return (mq.TLO.Target.Distance() or 999) <= 10
 end
 
+-- Per-trip record of which bank bags we've opened. rightmouseup TOGGLES with no memory, so
+-- re-toggling a bag another item just opened was the thrash. Open each needed bag ONCE, remember
+-- it, never toggle it again. Only bags we actually withdraw from get opened (small batches stay fast).
+local bank_bag_opened = {}
+
 local function open_bank()
     if mq.TLO.Window('BigBankWnd').Open() then return true end
     mq.cmd('/click right target')
     mq.delay(1000, function() return mq.TLO.Window('BigBankWnd').Open() end)
-    return mq.TLO.Window('BigBankWnd').Open()
+    if mq.TLO.Window('BigBankWnd').Open() then
+        bank_bag_opened = {}   -- fresh bank open: no bank bags open yet, start the per-trip set clean
+        return true
+    end
+    return false
 end
 
 local function close_bank()
@@ -181,6 +231,13 @@ local function close_bank()
         mq.cmd('/notify BigBankWnd DoneButton leftmouseup')
         mq.delay(300)
     end
+end
+
+-- Open ONE bank bag (only when a withdraw needs it) and remember it for the rest of the trip.
+local function ensure_bank_bag_open(b)
+    if bank_bag_opened[b] then return end   -- already opened this trip; leave it open
+    mq.cmdf('/itemnotify bank%d rightmouseup', b); mq.delay(200)
+    bank_bag_opened[b] = true
 end
 
 -- Set the split (QuantityWnd) to exactly n. The window ONLY pops if the bank bag is open (closed
@@ -220,17 +277,26 @@ local function withdraw_item(name, n)
                         if exact then
                             local slotStack = bankSlot.Item(s).Stack() or 1
                             if n >= slotStack then
-                                -- want the whole slot stack (<= n): grab it plainly, NO split/bag-open
-                                -- (this is the common 1-from-1 case; the bag-open dance only broke it).
-                                mq.cmdf('/nomodkey /itemnotify in bank%d %d leftmouseup', b, s)
-                                mq.delay(1000, function() return (mq.TLO.Cursor.ID() or 0) > 0 end)
+                                -- want the whole slot stack: OPEN the bank bag (rightmouseup) THEN grab.
+                                -- /lazbagtest proved the plain no-open grab hits NOTHING for items inside
+                                -- a bank bag (bank stays full, cursor empty) - the bag-open is required.
+                                -- rightmouseup TOGGLES, so retry (re-toggle self-corrects) like the
+                                -- partial path below. No /nomodkey - the crafter's proven gesture.
+                                ensure_bank_bag_open(b)   -- open THIS bag once (only bags we use); remembered, never re-toggled
+                                for attempt = 1, 4 do
+                                    if attempt == 3 then bank_bag_opened[b] = nil; ensure_bank_bag_open(b) end   -- rare: initial open missed, re-open once
+                                    mq.cmdf('/itemnotify in bank%d %d leftmouseup', b, s)
+                                    mq.delay(800, function() return (mq.TLO.Cursor.ID() or 0) > 0 end)
+                                    if (mq.TLO.Cursor.ID() or 0) > 0 then break end
+                                    mq.delay(150)
+                                end
                             else
                                 -- true partial: retry open+grab (re-toggle self-corrects) until the
                                 -- split pops, putting back any whole-stack grab between tries.
                                 local gotSplit = false
-                                for _ = 1, 4 do
-                                    mq.cmdf('/itemnotify bank%d rightmouseup', b)
-                                    mq.delay(450)
+                                ensure_bank_bag_open(b)   -- open THIS bag once (only bags we use); remembered, never re-toggled
+                                for attempt = 1, 4 do
+                                    if attempt == 3 then bank_bag_opened[b] = nil; ensure_bank_bag_open(b) end   -- rare: initial open missed, re-open once
                                     mq.cmdf('/itemnotify in bank%d %d leftmouseup', b, s)
                                     mq.delay(800, function() return mq.TLO.Window('QuantityWnd').Open() or (mq.TLO.Cursor.ID() or 0) > 0 end)
                                     if mq.TLO.Window('QuantityWnd').Open() then gotSplit = true; break end
@@ -250,8 +316,14 @@ local function withdraw_item(name, n)
                                 end
                             end
                         else
-                            mq.cmdf('/nomodkey /itemnotify in bank%d %d leftmouseup', b, s)   -- whole stack
-                            mq.delay(1000, function() return (mq.TLO.Cursor.ID() or 0) > 0 or mq.TLO.Window('QuantityWnd').Open() end)
+                            ensure_bank_bag_open(b)   -- open THIS bag once (only bags we use); remembered, never re-toggled
+                            for attempt = 1, 4 do
+                                if attempt == 3 then bank_bag_opened[b] = nil; ensure_bank_bag_open(b) end   -- rare: initial open missed, re-open once
+                                mq.cmdf('/itemnotify in bank%d %d leftmouseup', b, s)
+                                mq.delay(800, function() return (mq.TLO.Cursor.ID() or 0) > 0 or mq.TLO.Window('QuantityWnd').Open() end)
+                                if (mq.TLO.Cursor.ID() or 0) > 0 or mq.TLO.Window('QuantityWnd').Open() then break end
+                                mq.delay(150)
+                            end
                             if mq.TLO.Window('QuantityWnd').Open() then
                                 mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
                                 mq.delay(500, function() return not mq.TLO.Window('QuantityWnd').Open() end)
@@ -379,29 +451,14 @@ local function trade_item(toChar, itemName, qty)
                 mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
                 mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) > 0 end)
             else
-                -- Split wouldn't open after retries. Rather than deliver NOTHING (the 0-delivery bug),
-                -- fall back to handing over the WHOLE slot stack. The crafter gets more than the exact
-                -- ask, which is harmless for stackable mats (excess sits in bags / gets used or sold) and
-                -- far better than a failed craft. Grab the stack BY NAME (/itemnotify "name") - this does
-                -- NOT need the bag window open, unlike the by-slot "in packN" gesture that just failed in
-                -- the split loop above (if the bag closed, every "in packN" pickup fails, which is why both
-                -- the split AND a by-slot whole-grab came up empty). By-name is what the suite uses reliably.
-                log('trade_item: split would not open for %s - handing over the whole stack (%d) instead of nothing.', itemName, slotStack)
+                -- Split wouldn't open. With bags opened once up front this is now rare - and we do NOT
+                -- dump the whole stack (that was the "+456 for a 16 ask" over-deliver). Put back anything
+                -- on the cursor and stop short: worst case we deliver slightly LESS, never more.
+                log('trade_item: split would not open for %s - stopping short (never over-deliver).', itemName)
                 if (mq.TLO.Cursor.ID() or 0) > 0 then
                     mq.cmd('/autoinventory'); mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
                 end
-                mq.cmdf('/nomodkey /itemnotify "%s" leftmouseup', itemName)
-                mq.delay(900, function() return (mq.TLO.Cursor.ID() or 0) > 0 or mq.TLO.Window('QuantityWnd').Open() end)
-                if mq.TLO.Window('QuantityWnd').Open() then
-                    -- a split popped (stackable): accept to take the whole stack
-                    mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
-                    mq.delay(500, function() return (mq.TLO.Cursor.ID() or 0) > 0 end)
-                end
-                if (mq.TLO.Cursor.ID() or 0) == 0 then
-                    log('trade_item: whole-stack grab of %s also failed - stopping short.', itemName)
-                    break
-                end
-                -- fall through: cursor now holds the stack; the place-on-target below delivers it
+                break
             end
         end
         if (mq.TLO.Cursor.ID() or 0) == 0 then
@@ -454,119 +511,24 @@ local function trade_item(toChar, itemName, qty)
     return true, placed
 end
 
--- Multi-item version of trade_item: fill ONE trade window with up to 8 stacks drawn
--- from SEVERAL items, then let E3 confirm. Same per-slot pick-up/drop-on-target
--- mechanics as trade_item (proven) - the only difference is we walk a list of items
--- instead of stacks of one. Respects a per-item cap (stack mode = 1000, all = no cap)
--- and the running 'delivered' tally so we never over-hand a stack-mode item.
--- Returns the number of units placed THIS trip (0 = nothing placed / failed).
-local function trade_batch_window(toChar, items, cap, delivered)
-    if not nav_to_char(toChar) then log('Could not reach %s.', toChar); return 0 end
-    mq.cmdf('/target pc %s', toChar)
-    mq.delay(500, function() return (mq.TLO.Target.Name() or ''):lower() == toChar:lower() end)
-    if (mq.TLO.Target.Name() or ''):lower() ~= toChar:lower() then
-        log('Could not target %s.', toChar); return 0
-    end
-    mq.cmd('/face fast')
-    mq.delay(200)
-    mq.cmd('/e3p off')   -- live E3 confirms the trade; re-paused on every exit below
-    mq.delay(200)
-
-    local slotsUsed = 0
-    local placedThisTrip = 0
-    for _, b in ipairs(items) do
-        while slotsUsed < 8 and (delivered[b.item] or 0) < (cap[b.item] or math.huge) do
-            local bagNum, slotNum = find_item_slot(b.item)
-            if not bagNum then break end   -- no more of this item in bags
-            local slotStack = mq.TLO.Me.Inventory('pack' .. bagNum).Item(slotNum).Stack() or 1
-            local want = math.min((cap[b.item] or math.huge) - (delivered[b.item] or 0), slotStack)
-
-            if want >= slotStack then
-                -- take the whole slot stack (no split needed)
-                mq.cmdf('/nomodkey /itemnotify in pack%d %d leftmouseup', bagNum, slotNum)
-                mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) > 0 or mq.TLO.Window('QuantityWnd').Open() end)
-                if mq.TLO.Window('QuantityWnd').Open() then
-                    mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
-                    mq.delay(500, function() return not mq.TLO.Window('QuantityWnd').Open() end)
-                end
-            else
-                -- partial: the split only pops with the bag open AND good timing, and the first grab
-                -- after opening often misses. Retry: re-issue the bag-open each attempt (right-click
-                -- toggles, so alternating self-corrects whether it started open or closed), grab, and
-                -- if a whole stack came instead of the split, put it back and try again.
-                local gotSplit = false
-                for _ = 1, 4 do
-                    mq.cmdf('/itemnotify pack%d rightmouseup', bagNum)
-                    mq.delay(450)
-                    mq.cmdf('/itemnotify in pack%d %d leftmouseup', bagNum, slotNum)
-                    mq.delay(800, function() return mq.TLO.Window('QuantityWnd').Open() or (mq.TLO.Cursor.ID() or 0) > 0 end)
-                    if mq.TLO.Window('QuantityWnd').Open() then gotSplit = true; break end
-                    if (mq.TLO.Cursor.ID() or 0) > 0 then   -- whole stack came; put back and retry
-                        mq.cmd('/autoinventory'); mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-                    end
-                    mq.delay(150)
-                end
-                if gotSplit then
-                    if not set_split_qty(want) then
-                        log('batch: could not set partial %d of %s - stopping this item.', want, b.item)
-                        mq.cmd('/keypress esc'); mq.delay(300, function() return not mq.TLO.Window('QuantityWnd').Open() end)
-                        break
-                    end
-                    mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
-                    mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) > 0 end)
-                else
-                    log('batch: split would not open for a partial of %s after retries - stopping this item.', b.item)
-                    break   -- cursor already emptied in the loop; no over-deliver
-                end
-            end
-            if (mq.TLO.Cursor.ID() or 0) == 0 then log('Failed to pick up %s.', b.item); break end
-            local stackSize = mq.TLO.Cursor.Stack() or 1
-
-            mq.cmd('/notify TargetWindow Target_HP leftmouseup')
-            mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-            if (mq.TLO.Cursor.ID() or 0) > 0 then
-                mq.cmd('/click left target')
-                mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-            end
-            if (mq.TLO.Cursor.ID() or 0) > 0 then
-                log('Could not place %s on %s.', b.item, toChar)
-                mq.cmd('/autoinventory')
-                break
-            end
-
-            delivered[b.item] = (delivered[b.item] or 0) + stackSize
-            placedThisTrip = placedThisTrip + stackSize
-            slotsUsed = slotsUsed + 1
-        end
-        if slotsUsed >= 8 then break end   -- window full; caller starts another trip
-    end
-
-    if slotsUsed == 0 then
-        if mq.TLO.Window('TradeWnd').Open() then
-            mq.cmd('/notify TradeWnd TRDW_Cancel_Button leftmouseup')
-        end
-        mq.cmd('/e3p on')
-        return 0
-    end
-
-    log('Placed %d unit(s) across %d slot(s) - waiting for trade to complete...', placedThisTrip, slotsUsed)
-    mq.delay(8000, function() return not mq.TLO.Window('TradeWnd').Open() end)
-    if mq.TLO.Window('TradeWnd').Open() then
-        log('Trade window still open - cancelling.')
-        mq.cmd('/notify TradeWnd TRDW_Cancel_Button leftmouseup')
-        mq.cmd('/e3p on')
-        return 0   -- items return to bags; caller's no-progress guard will stop the loop
-    end
-    mq.cmd('/e3p on')
-    return placedThisTrip
-end
-
 -- Deliver a whole batch of items in ONE bank trip + as few trades as possible.
 -- Phase 1: walk to the banker once and withdraw every item toward its target
 --          (stack mode -> top up to 1000; all mode -> pull the bank dry).
--- Phase 2: walk to the crafter and hand everything over, 8 stacks per trade window,
---          repeating only when there's more than a window's worth. A /ts_have ping
---          before each trip keeps the crafter waiting. Returns total units delivered.
+-- Phase 2: walk to the crafter and hand everything over one item per trade window
+--          (single-item trades are reliable; multi-item packing was not). A /ts_have
+--          ping before each trip keeps the crafter waiting. Returns total units delivered.
+local function open_all_bags()
+    -- Open every inventory bag ONCE so a plain slot grab pops the split for a partial (AdventureTime's
+    -- reliable gesture). Right-click TOGGLES, so per-pickup toggling closed already-open bags and killed
+    -- the split. Call at trade start to open all, and again at the end to toggle back to closed.
+    for b = 1, 10 do
+        if (mq.TLO.Me.Inventory('pack' .. b).Container() or 0) > 0 then
+            mq.cmdf('/itemnotify pack%d rightmouseup', b); mq.delay(50)
+        end
+    end
+    mq.delay(300)
+end
+
 local function deliver_batch(toChar, batch)
     -- Per-item cap: exact qty when given, else stack (1000) or all (everything).
     local cap = {}
@@ -581,7 +543,11 @@ local function deliver_batch(toChar, batch)
     end
     if needBank then
         log('Batch: one bank trip for %d item(s)...', #batch)
-        if nav_to_banker() and open_bank() then
+        local navd = nav_to_banker()
+        local opened = navd and open_bank()
+        if not navd then log('Batch: nav_to_banker() FAILED - no banker reached (target dist %s) - cannot withdraw.', tostring(mq.TLO.Target.Distance())) end
+        if navd and not opened then log('Batch: reached banker but open_bank() FAILED - bank window did not open.') end
+        if navd and opened then
             for _, b in ipairs(batch) do
                 bump_alive()   -- a big multi-item withdraw shouldn't trip the idle timer
                 if cap[b.item] ~= math.huge then
@@ -617,6 +583,7 @@ local function deliver_batch(toChar, batch)
     -- window is unreliable (only the first item, which opens the window, places cleanly); single-item
     -- trades are rock-solid. The expensive part - the bank trip - was already consolidated in Phase 1,
     -- so we still make just one bank run; we just hand items over one clean trade at a time.
+    open_all_bags()   -- bags stay open for the whole trade so partial grabs pop the split
     local delivered = {}
     for _, b in ipairs(batch) do
         bump_alive()
@@ -645,6 +612,7 @@ local function deliver_batch(toChar, batch)
         end
     end
 
+    open_all_bags()   -- toggle bags back to their original state
     local total = 0
     for item, q in pairs(delivered) do
         total = total + q
@@ -1259,6 +1227,23 @@ end)
 -- Batch protocol: the crafter sends one /ts_qadd per item to build a list (no action),
 -- then /ts_qrun to execute it as a single bank trip + trade. This avoids cramming a long
 -- item list into one command line, and lets the mule grab everything in one go.
+-- /lazbankopen: diagnostic. Open the bank first, then run this to watch every bank bag pop open.
+-- Confirms the open-all-bank-bags gesture before trusting it in a real withdraw (like /lazbagtest).
+mq.bind('/lazbankopen', function()
+    if not mq.TLO.Window('BigBankWnd').Open() then
+        log('/lazbankopen: open the bank window first, then run it again.'); return
+    end
+    local opened = 0
+    for b = 1, 24 do
+        local bs = mq.TLO.Me.Bank(b)
+        if (bs.ID() or 0) > 0 and (bs.Container() or 0) > 0 then
+            log('  opening bank%d (%s, %d slots)', b, bs.Name() or '?', bs.Container() or 0)
+            mq.cmdf('/itemnotify bank%d rightmouseup', b); mq.delay(120); opened = opened + 1
+        end
+    end
+    log('/lazbankopen: toggled %d bank container(s) - verify they ALL opened (not some closed).', opened)
+end)
+
 mq.bind('/ts_qadd', function(encoded, mode, qtyStr)
     if not encoded then return end
     bump_alive()

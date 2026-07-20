@@ -207,8 +207,8 @@ local UI = {
 }
 
 local state = {
-    VERSION = '1.0',                               -- release version, shown in the title bar
-    BUILD_TAG = 'release-1.01-2026-07-17',   -- dev build marker; bump on every change (log header + Settings = stale-copy check)
+    VERSION = '1.01',                              -- release version, shown in the title bar
+    BUILD_TAG = 'release-1.01-2026-07-19',            -- release marker (log header + Settings = stale-copy check)
     running = true,
     windowOpen = true,
     wasOpen = true,
@@ -500,9 +500,10 @@ end
 -- selections and any recipes they've hand-added to a leveling path (which otherwise reset on
 -- reload). Auto-saved on change; loaded once at startup.
 state.customPathAdditions = {}   -- [pathName] = { recipeName, ... }  (persisted per character)
-state.illusionSpell = ''   -- faction-zone illusion (Felwithe/Jaggedpine): one of spell / AA / item
-state.illusionAA    = ''
-state.illusionItem  = ''
+state.illusionName = ''       -- faction-zone illusion (Felwithe/Jaggedpine): Name + Type (Spell/Item/AA)
+state.illusionType = 'Spell'  -- 'Spell' | 'Item' | 'AA'
+state.shrinkName   = ''       -- optional shrink before a buy/craft approach; blank Name = never pause to shrink
+state.shrinkType   = 'Item'   -- 'Spell' | 'Item' | 'AA'
 state.settings_path = function()
     local char = ''
     pcall(function() char = mq.TLO.Me.Name() or '' end)
@@ -560,9 +561,17 @@ state.load_settings = function()
             end
         elseif section == 'Illusion' then
             local k, v = line:match('^(.-)=(.*)$')
-            if k == 'Spell' then state.illusionSpell = v or ''
-            elseif k == 'AA' then state.illusionAA = v or ''
-            elseif k == 'Item' then state.illusionItem = v or '' end
+            if k == 'Name' then state.illusionName = v or ''
+            elseif k == 'Type' then state.illusionType = v or 'Spell'
+            -- migrate old 3-key format (Spell=/Item=/AA=) -> Name + Type
+            elseif k == 'Spell' and (v or '') ~= '' then state.illusionName = v; state.illusionType = 'Spell'
+            elseif k == 'Item'  and (v or '') ~= '' then state.illusionName = v; state.illusionType = 'Item'
+            elseif k == 'AA'    and (v or '') ~= '' then state.illusionName = v; state.illusionType = 'AA' end
+        elseif section == 'Shrink' then
+            local k, v = line:match('^(.-)=(.*)$')
+            if k == 'Name' then state.shrinkName = v or ''
+            elseif k == 'Type' then state.shrinkType = v or 'Item'
+            elseif k == 'Item' and (v or '') ~= '' then state.shrinkName = v; state.shrinkType = 'Item' end
         elseif section == 'Welcome' then
             local k, v = line:match('^(.-)=(.*)$')
             if k == 'DontDefault' then state.welcomeDontDefault = (v == '1')
@@ -635,9 +644,11 @@ state.save_settings = function()
         if state.speedSel and state.speedSel[k] then fh:write(k .. '=' .. state.speedSel[k] .. '\n') end
     end
     fh:write('\n[Illusion]\n')
-    fh:write('Spell=' .. (state.illusionSpell or '') .. '\n')
-    fh:write('AA='    .. (state.illusionAA or '')    .. '\n')
-    fh:write('Item='  .. (state.illusionItem or '')  .. '\n')
+    fh:write('Name=' .. (state.illusionName or '') .. '\n')
+    fh:write('Type=' .. (state.illusionType or 'Spell') .. '\n')
+    fh:write('\n[Shrink]\n')
+    fh:write('Name=' .. (state.shrinkName or '') .. '\n')
+    fh:write('Type=' .. (state.shrinkType or 'Item') .. '\n')
     fh:write('\n[Welcome]\n')
     fh:write('DontDefault=' .. (state.welcomeDontDefault and '1' or '0') .. '\n')
     fh:write('CharCount=' .. tostring(state.summonCharCount or 1) .. '\n')
@@ -762,26 +773,112 @@ state.same_zone_peers = function()
 end
 
 
--- Read a networked peer's CURRENT zone remotely (works cross-zone, unlike the spawn check). DanNet
--- carries this; the exact accessor varies by binding, so try a few patterns pcall-safe. Returns the
--- zone shortname string, or '' if we couldn't read it (fail-safe: an unreadable peer is simply not
--- counted as "in a reachable hub", so we never travel on a guess). NOTE: the AFK mirror shares its
--- zone shortname with the regular zone, so this tells us "in a Marr/PoK instance" but NOT live-vs-AFK -
--- that distinction is resolved later by the spawn check after we actually travel there.
-state.peer_zone = function(name)
-    if not name or name == '' then return '' end
-    -- Use a LIVE query, not a cached observation. Confirmed in-game: DanNet's Observe lags badly when a
-    -- peer changes zones (it kept reading poknowledge after the peer moved to potranquility, sending the
-    -- crafter to the wrong place). /dquery round-trips to the peer and returns its ACTUAL current zone -
-    -- it can't go stale because nothing is cached. Fire the query, poll for the result, return it.
-    local z = ''
-    pcall(function() mq.cmdf('/dquery %s -q Zone.ShortName', name) end)
-    local dl = mq.gettime() + 2000   -- allow for the network round-trip
+-- Generic DanNet peer read, straight from Lua (no listener round-trip). Fires ONE /dquery, then polls
+-- the peer's own DanNet[peer].Q[query] result off the TLO until it lands - a LIVE query, never a stale
+-- observation (Observe lagged badly on zone changes, so we always query). Returns the value as a
+-- trimmed string, or '' on timeout. This is the reusable version of the old hand-rolled zone read:
+-- any peer MQ-TLO expression works - 'Zone.ShortName', 'Me.PctHPs', 'Me.CombatState', 'CountBuffs', etc.
+-- CAVEAT: the query is a raw TLO expression sent through /dquery, so expressions with SPACES or quotes
+-- (e.g. FindItemCount[=Powder of Ro]) are fragile to escape over the wire - that's exactly why item
+-- supply goes through the TradeskillListener (clean command, peer parses the name locally) rather than
+-- a direct dquery. Use this for simple, space-free reads.
+state.dannet_query = function(peer, query, timeout)
+    if not peer or peer == '' or not query or query == '' then return '' end
+    timeout = timeout or 2000
+    pcall(function() mq.cmdf('/dquery %s -q "%s"', peer, query) end)   -- QUOTE the query: names with spaces (FindItemCount[=Powder of Ro]) get chopped at the first space unquoted
+    local dl = mq.gettime() + timeout   -- allow for the network round-trip
     while mq.gettime() < dl do
         mq.delay(40)
-        local ok, v = pcall(function() return mq.TLO.DanNet(name).Q('Zone.ShortName')() end)
-        if ok and v and tostring(v) ~= '' and tostring(v) ~= 'NULL' then z = tostring(v); break end
+        local ok, v = pcall(function() return mq.TLO.DanNet(peer).Q(query)() end)
+        if ok and v ~= nil and tostring(v) ~= '' and tostring(v) ~= 'NULL' then
+            return (tostring(v)):gsub('^%s+', ''):gsub('%s+$', '')
+        end
     end
+    return ''
+end
+
+-- Numeric convenience: read a peer TLO number (0 on failure). e.g. state.dannet_number(peer, 'Me.PctHPs').
+state.dannet_number = function(peer, query, timeout)
+    return tonumber(state.dannet_query(peer, query, timeout)) or 0
+end
+
+-- Read a peer's on-hand count of an EXACT item directly via DanNet (no /ts_check listener round-trip).
+-- FindItemCount[=name] returns 0 for none (a valid answer), so we distinguish that from a FAILED query:
+-- returns the count (>=0) on success, or -1 if the query never came back (caller falls back to the
+-- listener). Item names carry spaces / apostrophes - this test proves whether Laz's DanNet passes them
+-- cleanly over /dquery; if it can't, we keep the listener for supply.
+state.peer_item_count = function(peer, itemName)
+    if not peer or peer == '' or not itemName or itemName == '' then return -1 end
+    -- Count BOTH the peer's inventory AND its bank - a mule can deliver from either (its listener
+    -- withdraws from the bank). FindItemCount = bags/equipped; FindItemBankCount = bank.
+    local inv  = state.dannet_query(peer, string.format('FindItemCount[=%s]', itemName), 2000)
+    local bank = state.dannet_query(peer, string.format('FindItemBankCount[=%s]', itemName), 2000)
+    if inv == '' and bank == '' then return -1 end   -- both timed out / no reply
+    return (tonumber(inv) or 0) + (tonumber(bank) or 0)
+end
+
+-- Query a SET of peers for their on-hand count of each item, listener-free, all in parallel (round-trips
+-- overlap - mirrors query_peer_zones). Populates state.availReplies[item]=total and
+-- state.availHolders[item]={peer=qty} EXACTLY as the old /ts_avail path did, so every downstream
+-- delivery consumer is unchanged. Returns { itemName = total } for items at least one peer stocks.
+state.peer_item_counts = function(peers, items)
+    state.availReplies = {}
+    state.availHolders = {}
+    if not peers or #peers == 0 or not items or #items == 0 then return {} end
+    -- Fire ONE query per peer per pass, never FindItemCount and FindItemBankCount to the same peer at
+    -- once: on Laz's DanNet two concurrent queries to one peer collide (the second .Q read returns the
+    -- FIRST query's result), so a BANK-only item read back its bags count (0) and got skipped -> bought.
+    -- So for each item we sweep bags across all peers, read them, THEN sweep bank across all peers. This
+    -- is the same one-query-per-peer shape as query_peer_zones, which never misbehaved.
+    local function sweep(query)
+        for _, pr in ipairs(peers) do
+            pcall(function() mq.cmdf('/dquery %s -q "%s"', pr, query) end)
+        end
+        local res = {}
+        local deadline = mq.gettime() + 2000
+        while mq.gettime() < deadline do
+            mq.delay(40)
+            local pending = false
+            for _, pr in ipairs(peers) do
+                if res[pr] == nil then
+                    local got
+                    pcall(function()
+                        local v = mq.TLO.DanNet(pr).Q(query)()
+                        if v ~= nil and tostring(v) ~= '' and tostring(v) ~= 'NULL' then got = tonumber(tostring(v)) or 0 end
+                    end)
+                    if got ~= nil then res[pr] = got else pending = true end
+                end
+            end
+            if not pending then break end
+        end
+        return res
+    end
+    for _, item in ipairs(items) do
+        local inv  = sweep(('FindItemCount[=%s]'):format(item))
+        local bank = sweep(('FindItemBankCount[=%s]'):format(item))
+        for _, pr in ipairs(peers) do
+            local total = (inv[pr] or 0) + (bank[pr] or 0)
+            if total > 0 then
+                state.availReplies[item] = (state.availReplies[item] or 0) + total
+                state.availHolders[item] = state.availHolders[item] or {}
+                state.availHolders[item][pr] = (state.availHolders[item][pr] or 0) + total
+            end
+        end
+    end
+    local avail = {}
+    for _, item in ipairs(items) do
+        if (state.availReplies[item] or 0) > 0 then avail[item] = state.availReplies[item] end
+    end
+    return avail
+end
+
+-- Read a networked peer's CURRENT zone remotely (works cross-zone, unlike the spawn check). Fail-safe:
+-- an unreadable peer returns '' (not counted as "in a reachable hub", so we never travel on a guess).
+-- NOTE: the AFK mirror shares its zone shortname with the regular zone, so this says "in a Marr/PoK
+-- instance" but NOT live-vs-AFK - that's resolved later by the spawn check after we travel there.
+state.peer_zone = function(name)
+    if not name or name == '' then return '' end
+    local z = state.dannet_query(name, 'Zone.ShortName', 2000)
     -- Fallback: if the query didn't land but the peer is in OUR zone, our own zone shortname applies.
     if z == '' then
         pcall(function()
@@ -2688,6 +2785,7 @@ state.approachWaypoints = {
     { zone = ZONE_POK, loc = '-358.28 821.90 -92.55', radius = 100 },
     { zone = ZONE_POK, loc = '-381.12 469.72 -122.08', radius = 100 },
     { zone = ZONE_POK, loc = '3.66 223.33 -122.07', radius = 100 },
+    { zone = ZONE_POK, loc = '439.07 476.58 -122.08', radius = 100 },   -- Banker Ceridan/Granger staging spot (open either from here)
 }
 
 -- Plane of Marr "ferry": the two sides (X<0 = Side A, X>0 = Side B) are split by a pillar band near
@@ -2727,6 +2825,7 @@ end
 state.POK_FERRY_HUB     = '-357.55 826.30 -90.05'   -- Safe Hub (bank + stations side)
 state.POK_FERRY_DOCK    = '-363.72 722.83 -90.05'   -- Ferry (research-merchant pocket entrance)
 state.POK_FERRY_SPLIT_X = 748                        -- west of this X (Me.X) = in the pocket; the stations sit ~758+
+state.POK_FERRY_UPPER_Z = -100                       -- pocket is UPPER tier (z~-90); the lower crafting tier is z~-122/-124
 state.POK_RESEARCH_MERCHANTS = {
     ['blacksmith gerta'] = true, ['caden zharik']    = true, ['merchant tarrin']   = true,
     ['scholar klaz']     = true, ['eric rasumus']    = true, ['maree rasumus']     = true,
@@ -2734,11 +2833,19 @@ state.POK_RESEARCH_MERCHANTS = {
 }
 -- Cross via the ferry lane if this PoK trip enters or leaves the research-merchant pocket. destName is
 -- the NPC we're navving to (nil for bank/station trips - those can only be LEAVING the pocket). Returns
--- true if it ferried, so the caller skips the radius-hub router for this trip.
+-- 'in'  (ferried IN to the pocket for a research merchant - the ferry owns the trip, so the caller
+--        skips the radius-hub router to avoid roaming),
+-- 'out' (ferried OUT of the pocket for a non-merchant dest - the caller STILL stages the
+--        destination's own hub afterward so the descent doesn't wedge), or false.
 state.route_pok_ferry = function(destName, destZone)
     if (destZone or current_zone()) ~= ZONE_POK then return false end
     local isMerch  = (destName and state.POK_RESEARCH_MERCHANTS[tostring(destName):lower()]) or false
+    -- The pocket is UPPER tier. The lower crafting tier (forges/ovens/bankers) is ALSO X < SPLIT
+    -- but sits ~30 units lower, so an X-only test wrongly flagged lower-tier trips as "in the
+    -- pocket" and ferried them up to the research hub (skipping the forge/lower waypoint routing,
+    -- then wedging on the descent). Require upper tier so the lower tier is exempt.
     local inPocket = (mq.TLO.Me.X() or 0) < state.POK_FERRY_SPLIT_X
+                     and (mq.TLO.Me.Z() or 0) > state.POK_FERRY_UPPER_Z
     if isMerch then
         -- Going to a research merchant: the ferry OWNS this trip - always claim it so the radius-hub
         -- router never touches it. (That fall-through was the roaming: once we're in the pocket,
@@ -2749,13 +2856,13 @@ state.route_pok_ferry = function(destName, destZone)
             state.nav_loc_wait(state.POK_FERRY_HUB)
             state.nav_loc_wait(state.POK_FERRY_DOCK)
         end
-        return true
+        return 'in'
     elseif inPocket then
         -- Leaving the pocket for anywhere else (bank, a station, another zone): Ferry back out, then hub.
         printf_log('PoK: taking the ferry out of the research merchants (ferry -> safe hub)...')
         state.nav_loc_wait(state.POK_FERRY_DOCK)
         state.nav_loc_wait(state.POK_FERRY_HUB)
-        return true
+        return 'out'
     end
     return false
 end
@@ -2958,52 +3065,23 @@ end
 -- group for everything on craft start" cheap: nobody-has-it is a sub-second answer instead of a 10s
 -- per-item mule spin-up. Members must be in the crafter's current zone (they deliver in-zone).
 local function group_check(itemNames)
-    local myName = mq.TLO.Me.Name() or ''
     local mules = state.same_zone_peers()
-    state.availReplies = {}
-    state.availHolders = {}
-    if #mules == 0 then return {} end
-
-    -- Item counts come from the listener (/dquery can't read bracketed TLOs like FindItemCount[...] on this
-    -- build). Start each mule's listener, fire a batched check, collect /ts_avail replies.
-    for _, m in ipairs(mules) do state.peer_cmdf(m, '/lua run TradeskillListener') end
-    mq.delay(2500)   -- listener needs time to load merchants.ini + bind before it can answer (1500 was too
-                     -- short - the check fired before the listener was ready; 2000ms tested good, 2500 margin)
-    local CHUNK = 12
-    local function fireAll()
-        for _, m in ipairs(mules) do
-            local encoded = {}
-            for _, item in ipairs(itemNames) do encoded[#encoded + 1] = namecodec.encode(item) end
-            for i = 1, #encoded, CHUNK do
-                local slice = {}
-                for j = i, math.min(i + CHUNK - 1, #encoded) do slice[#slice + 1] = encoded[j] end
-                state.peer_cmdf(m, '/ts_check_multi %s %s', myName, table.concat(slice, '|'))
-            end
-        end
+    if #mules == 0 then
+        -- DIAGNOSTIC: no same-zone mules. Show what DanNet actually sees so we can tell a not-connected-yet
+        -- network (empty Peers) from a zone/instance mismatch - the recurring "0 mules right after a restart".
+        local okD, peers = pcall(function() return mq.TLO.DanNet.Peers() end)
+        printf_log('group_check: 0 same-zone mules. my zone=[%s]  DanNet.Peers=[%s]',
+            tostring(mq.TLO.Zone.ShortName() or '?'), okD and tostring(peers) or 'ERR')
+        state.availReplies = {}; state.availHolders = {}; return {}
     end
-    local function gather(window)
-        local deadline = mq.gettime() + window
-        local lastCount = -1
-        while mq.gettime() < deadline do
-            mq.doevents(); mq.delay(50)
-            local c = 0
-            for _, v in pairs(state.availReplies) do c = c + (v or 0) end
-            if c ~= lastCount then lastCount = c; deadline = math.max(deadline, mq.gettime() + 600) end
-        end
-    end
-    fireAll(); gather(1800)
-    local any = false
-    for _, item in ipairs(itemNames) do if (state.availReplies[item] or 0) > 0 then any = true; break end end
-    if not any then fireAll(); gather(2000) end   -- cold-listener retry
-
-    local avail = {}
-    for _, item in ipairs(itemNames) do
-        local n = state.availReplies[item] or 0
-        if n > 0 then avail[item] = n end
-    end
+    -- Item counts now come STRAIGHT FROM DanNet: FindItemCount[=name] over a quoted /dquery (proven
+    -- ~66ms, spaces AND apostrophes both pass on Laz). No listener startup, no /ts_check, no reply-gather
+    -- window - the TradeskillListener is only needed for the actual delivery + casting now. peer_item_counts
+    -- fills availReplies[item]=total and availHolders[item]={mule=qty}, so every delivery consumer is unchanged.
+    local avail = state.peer_item_counts(mules, itemNames)
     local got = 0
-    for _, v in pairs(state.availReplies) do if (v or 0) > 0 then got = got + 1 end end
-    printf_log('group_check: asked %d item(s) of %d mule(s), got %d positive repl(y/ies).', #itemNames, #mules, got)
+    for _ in pairs(avail) do got = got + 1 end
+    printf_log('group_check: asked %d item(s) of %d mule(s) via DanNet, %d in stock.', #itemNames, #mules, got)
     return avail
 end
 
@@ -3368,11 +3446,10 @@ local function request_all(itemName)
         elseif spawnHere() then
             reachable = true
         else
-            -- Same zone NAME but the mule isn't a spawn in THIS instance - we're likely in different
-            -- instances (live vs AFK mirror). Hop to the AFK mirror of this zone and re-check.
-            printf_log('%s reports %s but isn\'t in this instance - trying the AFK mirror...', muleName, mz)
-            if state.enter_afk(myZone) and spawnHere() then
-                printf_log('Found %s in the AFK mirror of %s.', muleName, myZone)
+            -- Same zone NAME but not a spawn in OUR instance - we can't tell live vs AFK. Resolve it
+            -- deterministically: anchor out and back (=> live), check, then the AFK mirror. Exhaustive.
+            printf_log('%s reports %s but isn\'t in our instance - resolving live vs AFK...', muleName, mz)
+            if state.reach_same_zone_holder(myZone, spawnHere) then
                 reachable = true
             else
                 printf_log('%s not reachable in %s (live or AFK mirror) - skipping.', muleName, myZone)
@@ -3495,9 +3572,8 @@ state.request_supply_grouped = function(items, targetChar)
             local cz = state.peer_zone(charName)
             local myZone = trim(mq.TLO.Zone.ShortName() or '')
             if cz ~= '' and cz == myZone then
-                printf_log('%s reports %s but isn\'t in this instance - trying the AFK mirror...', charName, cz)
-                if state.enter_afk(myZone) and spawnHere() then
-                    printf_log('Found %s in the AFK mirror of %s.', charName, myZone)
+                printf_log('%s reports %s but isn\'t in our instance - resolving live vs AFK...', charName, cz)
+                if state.reach_same_zone_holder(myZone, spawnHere) then
                     reachable = true
                 end
             end
@@ -3602,14 +3678,27 @@ end)
 state.lastShrinkZone = nil
 state.maybe_shrink = function(forWork)
     if not forWork then return end                    -- just traveling: don't bother shrinking
+    local name = trim(state.shrinkName or '')
+    if name == '' then return end                     -- no shrink configured: never pause to shrink (default)
     local z = current_zone()
     if state.lastShrinkZone == z then return end      -- already handled this zone
     if (mq.TLO.Me.Height() or 99) <= 2.5 then state.lastShrinkZone = z; return end  -- already small enough
+    local ty = state.shrinkType or 'Item'
+    if ty == 'Item' and item_count(name) < 1 then return end   -- item not on hand: act as if nothing was set
     state.lastShrinkZone = z
-    local SHRINK_ITEM = 'Shrunken Gnoll Head'         -- exact item name; change here if yours differs
-    if item_count(SHRINK_ITEM) >= 1 then
-        printf_log('Shrinking with %s before working in %s...', SHRINK_ITEM, z)
-        mq.cmdf('/useitem "%s"', SHRINK_ITEM)
+    mq.delay(500)   -- settle: an effect fired the instant a prior nav stops gets interrupted, so let movement stop first
+    printf_log('Shrinking (%s) with %s before working in %s...', ty, name, z)
+    if ty == 'Spell' then
+        mq.cmdf('/memspell 8 "%s"', name)
+        mq.delay(10000, function() return (mq.TLO.Me.Gem(8).Name() or '') == name end)
+        mq.cmd('/cast 8')
+        mq.delay(1500, function() return (mq.TLO.Me.Casting.ID() or 0) > 0 end)
+        mq.delay(12000, function() return (mq.TLO.Me.Casting.ID() or 0) == 0 end)
+    elseif ty == 'AA' then
+        mq.cmdf('/aa act %s', name)   -- no quotes: /aa act takes the whole name as-is
+        mq.delay(5000)
+    else   -- Item
+        mq.cmdf('/useitem "%s"', name)
         mq.delay(5000)   -- let the shrink cast finish before we start moving
     end
 end
@@ -3631,7 +3720,7 @@ end
 -- Faction-zone illusion: Felwithe and Jaggedpine vendors are faction-reliant, so apply the
 -- character's configured illusion once on zone-in, BEFORE the shrink. Spell mems into gem 8 and
 -- casts (waits out the cast so it lands before we move); Item is /useitem; AA is /aa act. Only one
--- is used (spell > item > AA). Fire-and-forget - we do NOT verify it worked, so a typo is on you.
+-- fires per the configured Type (Spell/Item/AA). Fire-and-forget - we do NOT verify it worked.
 -- No-op outside those two zones or if nothing is configured. Fires once per zone (lastIllusionZone).
 state.lastIllusionZone = nil
 state.maybe_illusion = function()
@@ -3639,24 +3728,24 @@ state.maybe_illusion = function()
     if z ~= ZONE_FELWITHE and z ~= ZONE_JAGGEDPINE then return end
     if state.lastIllusionZone == z then return end
     state.lastIllusionZone = z
-    local spell = trim(state.illusionSpell or '')
-    local item  = trim(state.illusionItem or '')
-    local aa    = trim(state.illusionAA or '')
-    if spell ~= '' then
-        printf_log('Illusion (faction zone): memming "%s" in gem 8 and casting...', spell)
-        mq.cmdf('/memspell 8 "%s"', spell)
-        mq.delay(10000, function() return (mq.TLO.Me.Gem(8).Name() or '') == spell end)
+    local name = trim(state.illusionName or '')
+    if name == '' then return end
+    local ty = state.illusionType or 'Spell'
+    if ty == 'Spell' then
+        printf_log('Illusion (faction zone): memming "%s" in gem 8 and casting...', name)
+        mq.cmdf('/memspell 8 "%s"', name)
+        mq.delay(10000, function() return (mq.TLO.Me.Gem(8).Name() or '') == name end)
         mq.cmd('/cast 8')
         mq.delay(1500, function() return (mq.TLO.Me.Casting.ID() or 0) > 0 end)   -- wait for the cast to start
         mq.delay(12000, function() return (mq.TLO.Me.Casting.ID() or 0) == 0 end) -- then to finish
         mq.delay(500)
-    elseif item ~= '' then
-        printf_log('Illusion (faction zone): /useitem %s...', item)
-        mq.cmdf('/useitem "%s"', item)
+    elseif ty == 'AA' then
+        printf_log('Illusion (faction zone): /aa act %s...', name)
+        mq.cmdf('/aa act %s', name)   -- no quotes: /aa act takes the whole name as-is
         mq.delay(3000)   -- give any cast a moment (not verified)
-    elseif aa ~= '' then
-        printf_log('Illusion (faction zone): /aa act %s...', aa)
-        mq.cmdf('/aa act %s', aa)   -- no quotes: /aa act takes the whole name as-is
+    else   -- Item
+        printf_log('Illusion (faction zone): /useitem %s...', name)
+        mq.cmdf('/useitem "%s"', name)
         mq.delay(3000)   -- give any cast a moment (not verified)
     end
 end
@@ -3704,9 +3793,19 @@ end
 -- just grab the nearest banker.
 state.target_banker = function()
     if current_zone() == ZONE_POK then
-        mq.cmd('/target Dogle Pitt')
-        mq.delay(500, function() return (mq.TLO.Target.ID() or 0) > 0 end)
-        if (mq.TLO.Target.ID() or 0) > 0 then return end
+        -- Nearest of the three known-good bankers (3D so the lower-tier gap counts). Dogle Pitt navs
+        -- clean; Banker Ceridan / Banker Granger are reached via the staging waypoint in
+        -- state.approachWaypoints (route_bank_via_hub routes through it). Picking nearest = less travel.
+        local who, whod
+        for _, n in ipairs({ 'Dogle Pitt', 'Banker Ceridan', 'Banker Granger' }) do
+            local d = mq.TLO.Spawn(n).Distance3D()
+            if d and d > 0 and (not whod or d < whod) then who, whod = n, d end
+        end
+        if who then
+            mq.cmdf('/target %s', who)
+            mq.delay(500, function() return (mq.TLO.Target.ID() or 0) > 0 end)
+            if (mq.TLO.Target.ID() or 0) > 0 then return end
+        end
     end
     mq.cmd('/target npc banker')
     mq.delay(500, function() return (mq.TLO.Target.ID() or 0) > 0 end)
@@ -3765,6 +3864,55 @@ local function marr_unstick()
     end
 end
 
+-- Some vendors sit in tight/elevated geometry where navving straight onto the NPC lands us on the
+-- counter or wedges on height. For those zones we nav to a fixed staging loc NEXT TO the vendor
+-- (close enough to open the merchant) and STOP there - no final approach onto the spawn. Locs are
+-- "Y X Z" (/nav loc order). crouch=true runs the stuck->crouch mitigation while pathing there.
+state.CROUCH_CMD = '/keypress duck'   -- CONFIRM: the crouch/duck keybind for your client; swap if different
+state.vendorApproachLoc = {
+    [ZONE_THURGADIN] = { loc = '-337.18 -64.11 3.12', crouch = true },   -- off the counter; crouch to slip height
+    [ZONE_FELWITHE]  = { loc = '-88.09 -414.17 5.91' },
+}
+state.VENDOR_APPROACH_R = 50   -- only use the staging loc when the target vendor is within this of it
+
+-- Nav to a plain loc and wait until we arrive (or nav genuinely stops). If crouchOnStuck, and we make
+-- no real progress for >2s while still navigating, tap crouch once to slip geometry (stand back up on
+-- arrival). Returns true if we ended up within ~arriveDist of the loc.
+state.nav_loc_arrive = function(loc, arriveDist, crouchOnStuck)
+    arriveDist = arriveDist or 15
+    local ly, lx, lz = tostring(loc):match('([%-%.%d]+)%s+([%-%.%d]+)%s+([%-%.%d]+)')
+    if not ly then return false end
+    ly, lx, lz = tonumber(ly), tonumber(lx), tonumber(lz)
+    local function d3()
+        local dx = (mq.TLO.Me.X() or 0) - lx
+        local dy = (mq.TLO.Me.Y() or 0) - ly
+        local dz = (mq.TLO.Me.Z() or 0) - lz
+        return math.sqrt(dx*dx + dy*dy + dz*dz)
+    end
+    mq.cmdf('/nav loc %s', loc)
+    delay(1500, function() return mq.TLO.Navigation.Active() or d3() <= arriveDist end)
+    local deadline  = mq.gettime() + 60000
+    local lastX, lastY = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0
+    local stuckSince = mq.gettime()
+    local crouched   = false
+    while mq.gettime() < deadline do
+        check_stop()
+        if d3() <= arriveDist then break end
+        if not mq.TLO.Navigation.Active() then break end
+        local nx, ny = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0
+        if math.sqrt((nx-lastX)^2 + (ny-lastY)^2) > 3 then
+            lastX, lastY, stuckSince = nx, ny, mq.gettime()   -- real progress: reset the stuck timer
+        elseif crouchOnStuck and not crouched and (mq.gettime() - stuckSince) > 2000 then
+            printf_log('Stuck for >2s pathing to the staging spot - crouching to slip the geometry...')
+            mq.cmd(state.CROUCH_CMD)
+            crouched, stuckSince = true, mq.gettime()
+        end
+        delay(200)
+    end
+    if crouched then mq.cmd(state.CROUCH_CMD) end   -- stand back up so we don't walk the rest crouched
+    return d3() <= (arriveDist + 5)
+end
+
 local function nav_to_spawn(id, label)
     check_stop()
     if not id or id == 0 then
@@ -3793,11 +3941,30 @@ local function nav_to_spawn(id, label)
         -- Marr ferry first: if this is a cross-side trip, dock-to-dock across the clear north end before
         -- the normal approach. If it ferried, we're now on the destination's side; normal nav finishes.
         state.route_marr_ferry(sloc, current_zone())
-        -- PoK research-merchant pocket uses the explicit ferry lane (deterministic by vendor name) instead
-        -- of the radius hub, which over-navs and clips the station cluster. Only fall back to the radius
-        -- router when the ferry didn't handle this trip.
-        if not state.route_pok_ferry(label, current_zone()) then
+        -- PoK research-merchant pocket uses the explicit ferry lane (deterministic by vendor name).
+        -- Skip the radius-hub router only when the ferry took us INTO the pocket for a merchant
+        -- (it owns that trip). On a ferry-OUT (or no ferry), still stage the destination's own hub.
+        if state.route_pok_ferry(label, current_zone()) ~= 'in' then
             state.route_via_waypoint(sloc, current_zone())
+        end
+    end
+
+    -- Staging-loc vendors (Thurg/Felwithe): nav to the fixed spot beside the vendor and open
+    -- from there instead of pathing onto the NPC. Only when THIS target is the vendor the loc
+    -- serves (near it), so porters/other in-zone NPCs still nav normally.
+    local va = state.vendorApproachLoc[current_zone()]
+    if va then
+        local ay, ax, az = va.loc:match('([%-%.%d]+)%s+([%-%.%d]+)%s+([%-%.%d]+)')
+        local near = ay and (((mq.TLO.Target.Y() or 0)-tonumber(ay))^2
+                           + ((mq.TLO.Target.X() or 0)-tonumber(ax))^2
+                           + ((mq.TLO.Target.Z() or 0)-tonumber(az))^2) <= (state.VENDOR_APPROACH_R*state.VENDOR_APPROACH_R)
+        if near then
+            printf_log('Approaching %s via its staging spot (no counter-climb)...', label)
+            state.pre_nav(true)
+            local ok = state.nav_loc_arrive(va.loc, 15, va.crouch)
+            mq.cmd('/nav stop'); mq.cmd('/face fast')
+            if not ok then printf_log('Could not reach the staging spot for %s.', label) end
+            return ok
         end
     end
 
@@ -3896,11 +4063,11 @@ state.deliver_to_peer = function(peerName, itemName, qty)
         mq.cmdf('/itemnotify pack%d rightmouseup', bagNum)   -- open the bag so the split pops
         mq.delay(350)
         mq.cmdf('/itemnotify in pack%d %d leftmouseup', bagNum, slotNum)
-        mq.delay(1000, function() return mq.TLO.Window('QuantityWnd').Open() or (mq.TLO.Cursor.ID() or 0) > 0 end)
+        mq.delay(800, function() return mq.TLO.Window('QuantityWnd').Open() or (mq.TLO.Cursor.ID() or 0) > 0 end)
         if mq.TLO.Window('QuantityWnd').Open() then
             local wantS, set = tostring(want), false
             mq.cmdf('/invoke ${Window[QuantityWnd/QTYW_SliderInput].SetText[%d]}', want)
-            local deadline, ticks = mq.gettime() + 1500, 0
+            local deadline, ticks = mq.gettime() + 1200, 0
             repeat
                 if (mq.TLO.Window('QuantityWnd/QTYW_SliderInput').Text() or '') == wantS then set = true; break end
                 mq.delay(40); ticks = ticks + 1
@@ -4609,11 +4776,11 @@ local function world_open(cinfo)
                                        <= (WORLD_CLICK_RANGE * WORLD_CLICK_RANGE)
                 if not atStation then
                     state.route_marr_ferry(station.loc, station.zone)
-                    -- If we're currently in the PoK merchant pocket, ferry out first (leave-case only;
-                    -- a station is never a research merchant), then fall back to the radius router.
-                    if not state.route_pok_ferry(nil, station.zone) then
-                        state.route_via_waypoint(station.loc, station.zone)
-                    end
+                    -- A station is never a merchant, so route_pok_ferry can only ferry us OUT of
+                    -- the pocket. Always stage the station's own hub afterward (e.g. descend to the
+                    -- forge hub) - this is the sell-return-to-forge wedge fix.
+                    state.route_pok_ferry(nil, station.zone)
+                    state.route_via_waypoint(station.loc, station.zone)
                 end
             end
             state.pre_nav(true)   -- crafting here: shrink if needed
@@ -5308,6 +5475,11 @@ local function clear_kit(cinfo, kitPack, slotCount)
                 delay(1000, function() return cursor_id() == 0 end)
             end
             delay(300, function() return not kit_slot_name(kitPack, i) end)
+            -- Pace between pulls. The speed optimization above rips slots out back-to-back, but on a
+            -- desync-MERGED kit that just cascades more desyncs (the server can't keep up with a burst
+            -- of pulls). Mirror the settle resync()/kit_resync use between autoinventory pulls. Occasional
+            -- path (only when the kit has leftovers), so the cost is fine; tune via the autoinvPace knob.
+            delay(AUTOINV_PACE_MS)
         end
         if kit_slot_name(kitPack, i) then
             printf_log('WARNING: kit slot %d still occupied after clearing attempts.', i)
@@ -5803,9 +5975,48 @@ state.enter_afk = function(zoneShort)
     return true
 end
 
+-- We're in myZone but the holder isn't a spawn in OUR instance - and we can't tell whether WE are in the
+-- live zone or its AFK mirror (they share a shortname). Resolve it deterministically: a PORT always lands
+-- in LIVE, so hop OUT to a different hub then straight back to myZone (we're now in LIVE) and check. Still
+-- missing => they must be in the AFK mirror, so hop there and check. Live-then-mirror is exhaustive - if
+-- neither instance has them, the zone read was stale or they moved. spawnHere() is the caller's live
+-- visibility check for the specific holder.
+state.reach_same_zone_holder = function(myZone, spawnHere)
+    local back = state.CROSS_ZONES[myZone]
+    if not (back and back.travel) then return false end   -- can't port back here; nothing we can do
+    -- anchor via a DIFFERENT hub (Marr, unless we ARE in Marr - then PoK)
+    local anchor     = (myZone == ZONE_MARR) and travel_to_pok or travel_to_marr
+    local anchorName = (myZone == ZONE_MARR) and 'PoK' or 'Marr'
+    printf_log('  cannot tell live vs AFK - re-anchoring via %s to reach live %s...', anchorName, myZone)
+    if not anchor() then printf_log('  could not reach %s to re-anchor.', anchorName); return false end
+    if not back.travel() then printf_log('  could not port back into %s.', myZone); return false end
+    -- porting back landed us in LIVE
+    if spawnHere() then printf_log('  found in the LIVE instance of %s.', myZone); return true end
+    -- not in live => the AFK mirror is the only other place they can be
+    if back.afk and state.enter_afk(myZone) and spawnHere() then
+        printf_log('  found in the AFK mirror of %s.', myZone); return true
+    end
+    return false
+end
+
 -- Escalate to the next AFK mirror when all regular stations are in use. Order: Marr AFK, then PoK
 -- AFK. Advances the tier so we never re-enter the same mirror in a run; returns false when both are
 -- spent (world_open then falls back to its wait-and-retry). Reset to tier 0 at the start of each run.
+-- Leave an AFK mirror and land in the LIVE copy of the zone we're standing in. The mirror shares the
+-- zone shortname, so a plain travel no-ops ("already there") - hop to the OTHER hub and come back:
+-- leaving the zone entirely means the RETURN zones us into a fresh live instance. Self-guarding:
+-- returns false if the hop can't complete, so the caller degrades gracefully.
+state.rezone_to_live = function(zoneShort)
+    if zoneShort == ZONE_MARR then
+        if not travel_to_pok() then return false end   -- leaves the Marr mirror
+        return travel_to_marr()                        -- returns into LIVE Marr
+    elseif zoneShort == ZONE_POK then
+        if not travel_to_marr() then return false end  -- leaves the PoK mirror
+        return travel_to_pok()                         -- returns into LIVE PoK
+    end
+    return false
+end
+
 state.try_next_afk_instance = function()
     if state.afkTier < 1 then
         state.afkTier = 1
@@ -5917,33 +6128,10 @@ state.try_cross_zone_supply = function(itemName, needed, recipient)
         return 0
     end
     printf_log('Cross-zone: %d reachable peer(s) for %s: %s', #peers, itemName, table.concat(peers, ', '))
-    -- 2) Ask those reachable peers how much they hold via the listener (/dquery can't read FindItemCount[...]
-    --    on this build). Start their listeners, /ts_check_multi, collect /ts_avail replies.
-    --    TIMING (measured via /tsprobe): the reply crosses zones fine over E3, but a CROSS-ZONE /ts_avail
-    --    lands noticeably later than a same-zone one. The old sum-delta gather also never extended its
-    --    window on "have 0" replies (they don't change the tally), so with a few empty peers replying
-    --    first it closed BEFORE the real holder's reply arrived and reported "no holder" for stock a peer
-    --    plainly had (Belree: 15 Velium Bar - seen by /tsprobe's longer wait, missed by the 1.8s sweep).
-    --    Fix: poll THIS item's holder set directly, wait a generous window, re-fire once, and exit as soon
-    --    as a holder appears (plus a short grace so a bigger holder can still report before we pick best).
-    for _, p in ipairs(peers) do state.peer_cmdf(p, '/lua run TradeskillListener') end
-    mq.delay(2500)   -- listener load + bind time (see group_check note)
-    state.availReplies = {}
-    state.availHolders = {}
-    local enc = namecodec.encode(itemName)
-    local function fire() for _, p in ipairs(peers) do state.peer_cmdf(p, '/ts_check_multi %s %s', myName, enc) end end
-    local function waitForHolder(window)
-        local deadline = mq.gettime() + window
-        while mq.gettime() < deadline do
-            mq.doevents(); mq.delay(50)
-            if next(state.availHolders[itemName] or {}) then return true end
-        end
-        return false
-    end
-    fire()
-    local found = waitForHolder(3500)
-    if not found then fire(); found = waitForHolder(3000) end
-    if found then for _ = 1, 16 do mq.doevents(); mq.delay(50) end end   -- ~0.8s grace: let a bigger holder report in
+    -- 2) Ask those reachable peers how much they hold, via DanNet sweep (bags+bank), listener-free: no startup, no /ts_check broadcast, no gather window, and
+    -- none of the cross-zone /ts_avail latency games - each /dquery round-trips and we read the peer's own
+    -- result. Populates availHolders[itemName]={peer=qty}, keyed by the lowercase DanNet name (== peerZone).
+    state.peer_item_counts(peers, { itemName })
     local holders = state.availHolders[itemName] or {}
     local best, bestZone, bestQty = nil, nil, 0
     for holder, qty in pairs(holders) do
@@ -6018,37 +6206,12 @@ state.cross_zone_supply_grouped = function(items)
         return
     end
 
-    -- 2) ONE listener sweep for the WHOLE list (chunked, like group_check).
-    for _, p in ipairs(peers) do state.peer_cmdf(p, '/lua run TradeskillListener') end
-    mq.delay(2500)
-    state.availReplies = {}; state.availHolders = {}
-    local CHUNK = 12
-    local function fireAll()
-        for _, p in ipairs(peers) do
-            local enc = {}
-            for _, it in ipairs(items) do enc[#enc + 1] = namecodec.encode(it.name) end
-            for i = 1, #enc, CHUNK do
-                local slice = {}
-                for j = i, math.min(i + CHUNK - 1, #enc) do slice[#slice + 1] = enc[j] end
-                state.peer_cmdf(p, '/ts_check_multi %s %s', myName, table.concat(slice, '|'))
-            end
-        end
-    end
-    -- Settle-based gather on the DISTINCT-item reply count (so "have 0" replies still register). Wait
-    -- out cross-zone reply latency (min ~2.8s) then break once replies stop arriving for ~900ms.
-    local function gatherAll(maxWindow)
-        local deadline = mq.gettime() + maxWindow
-        local minUntil = mq.gettime() + 2800
-        local lastN, stableAt = -1, mq.gettime()
-        while mq.gettime() < deadline do
-            mq.doevents(); mq.delay(50)
-            local n = 0; for _ in pairs(state.availReplies) do n = n + 1 end
-            if n ~= lastN then lastN = n; stableAt = mq.gettime() end
-            if n > 0 and mq.gettime() > minUntil and (mq.gettime() - stableAt) > 900 then break end
-        end
-    end
-    fireAll(); gatherAll(6000)
-    if not next(state.availReplies) then fireAll(); gatherAll(4000) end
+    -- 2) ONE DanNet sweep for the WHOLE list, listener-free (bags+bank per peer, all in parallel).
+    --    Replaces the listener startup + chunked /ts_check_multi + settle-gather, and sidesteps the
+    --    cross-zone /ts_avail latency entirely (each /dquery round-trips; we read each peer's own result).
+    local itemNames = {}
+    for _, it in ipairs(items) do itemNames[#itemNames + 1] = it.name end
+    state.peer_item_counts(peers, itemNames)
 
     -- 3) Best reachable holder per item -> group by zone -> holder (holder resolved to its LOWERCASE
     --    peer name so peer_zone/AFK-hop/peer_cmdf all match; the listener reports proper-case names).
@@ -6259,10 +6422,12 @@ local function thurgadin_cross_bridge()
         mq.cmdf('/face fast heading %.2f', BRIDGE_HEADING)
         mq.delay(300)
         mq.cmd('/keypress forward hold')
-        local ddl = mq.gettime() + 15000
+        local hardCap = mq.gettime() + 45000   -- absolute safety cap; we bail earlier on sustained no-progress
         local lastDist = far_dist()
-        local lastImprove = mq.gettime()
-        while mq.gettime() < ddl do
+        local lastImprove = mq.gettime()   -- last time we actually gained ground
+        local lastToggle  = mq.gettime()   -- last crouch/stand toggle
+        local crouched = false
+        while mq.gettime() < hardCap do
             check_stop()
             local d = far_dist()
             if d <= 10 then break end
@@ -6270,12 +6435,20 @@ local function thurgadin_cross_bridge()
             if d < lastDist - 0.5 then
                 lastDist = d
                 lastImprove = mq.gettime()
-            elseif (mq.gettime() - lastImprove) > 3000 then
-                break   -- no progress (wall/obstacle) - bail rather than spin
+                if crouched then mq.cmd(state.CROUCH_CMD); crouched = false end   -- unstuck: stand back up
+            elseif (mq.gettime() - lastToggle) > 2000 then
+                -- stuck 2s: toggle crouch. Crouching slips a height snag; if that didn't free us, standing
+                -- back up on the next toggle might - alternate until we move (forward stays held).
+                mq.cmd(state.CROUCH_CMD)
+                crouched = not crouched
+                lastToggle = mq.gettime()
+                printf_log('Bridge: stuck - %s to slip the geometry...', crouched and 'crouching' or 'standing back up')
             end
+            if (mq.gettime() - lastImprove) > 8000 then break end   -- genuinely wedged 8s despite toggling - give up
             mq.delay(150)
         end
         mq.cmd('/keypress forward')   -- release
+        if crouched then mq.cmd(state.CROUCH_CMD) end   -- stand back up so mesh nav runs at full speed
         mq.delay(300)
     end
     if far_dist() > 15 then
@@ -6992,8 +7165,7 @@ local function buy_pass(rec, quantity, defaultVendor)
     end
 
     if not next(needed) then
-        printf_log('Already have all ingredients - skipping buy pass.')
-        return true
+        return true   -- nothing short: silent no-op (avoids the double 'skipping' noise across pre-buy + preflight)
     end
 
     -- We ARE going to a vendor now, so close any open tradeskill/combine window before we walk off.
@@ -7180,6 +7352,14 @@ local function buy_pass(rec, quantity, defaultVendor)
             end
         end
         if vZone == current_zone() then
+            -- Vendor presence check (spawn-ID): some NPCs don't exist in an AFK mirror (e.g. Alchemist
+            -- Redsa isn't in Marr's mirror), yet the mirror shares the zone shortname so vZone matches.
+            -- If the NPC isn't spawned in THIS instance and we're in a mirror, hop back to the live copy
+            -- and re-check before navving - otherwise nav_to spins on a vendor that physically isn't here.
+            if (mq.TLO.Spawn('npc =' .. vName).ID() or 0) == 0 and (state.afkTier or 0) >= 1 then
+                printf_log('%s not present in this instance (AFK mirror) - returning to the live zone...', vName)
+                if state.rezone_to_live(current_zone()) then state.afkTier = 0 end
+            end
             printf_log('Buying from %s...', vName)
             if not nav_to(vName) then
                 printf_log('ERROR: could not reach vendor %s - aborting.', vName)
@@ -7288,14 +7468,10 @@ state.source_gems_for_plan = function(plan)
 
     -- How many of `item` does one peer hold right now (bags+bank)? Ask just that peer, read its reply.
     local function query_count(caster, item)
-        state.availReplies[item] = nil
-        state.peer_cmdf(caster, '/ts_check %s %s', myName, namecodec.encode(item))
-        local w = 0
-        while w < 1800 do
-            mq.doevents(); mq.delay(100); w = w + 100
-            if state.availReplies[item] ~= nil then break end
-        end
-        return state.availReplies[item] or 0
+        -- DanNet (bags+bank), listener-free - no /ts_check round-trip. peer_item_count returns -1 on a
+        -- failed query (peer down / no reply); treat that as 0.
+        local n = state.peer_item_count(caster, item)
+        return (n >= 0) and n or 0
     end
 
     -- Buy up to `n` of `baseGem` onto the crafter from its vendor (open_merchant navs + opens).
@@ -7947,6 +8123,11 @@ execute_recipe = function(itemName, qty, defaultVendor, kitPack, noRetry)
                 if not world_open(cinfo) then return false end
                 worldStaged = false
             else
+                -- The player likely MOVED the kit during the pause (rearranged bags), so re-seat it into
+                -- pack<kitPack> before opening - otherwise open_kit fails "must be in packN" and the resume
+                -- bails with "can't safely resume." Matches revalidate #2: re-adjust to the right state
+                -- (reopen/re-seat the kit) instead of giving up, since a pause means the player DID something.
+                if not ensure_kit_in_pack(recSec.Container or '', kitPack) then return false end
                 if not open_kit(cinfo, kitPack) then return false end
             end
             return true
@@ -8406,6 +8587,12 @@ ensure_kit_in_pack = function(containerName, kitPack)
 end
 
 local function run_engine(job)
+    -- Clear any leftover Stop from a PREVIOUS run FIRST. The supply-from-group pass below calls
+    -- check_stop(), but the main reset is LOWER DOWN (after that pass). Without clearing here, a stale
+    -- stopRequested (e.g. from a prior crash or Stop) aborts the supply phase on the very NEXT run,
+    -- before the reset can clear it - a crash loop that halts at the same spot every run and pulls
+    -- zero items. Clearing here does NOT swallow stops raised DURING this run (bank pre-pass, etc.).
+    state.stopRequested = false
     -- Disabled recipes ("Not Enabled" on Lazarus) are archived in the ini but can
     -- never be crafted - refuse before doing any work.
     if job.recipe and job.recipe.disabled then
@@ -8459,7 +8646,11 @@ local function run_engine(job)
             for _, nm in ipairs(list) do
                 if avail[nm] and avail[nm] > 0 then
                     toGet[#toGet + 1] = { name = nm, needed = target[nm], mode = 'stack' }
-                    printf_log('  group has %s (%d available) - requesting.', nm, avail[nm])
+                    -- show WHO holds it (from availHolders) so an attribution bug is visible directly in
+                    -- the log, before delivery even picks a mule.
+                    local hs = {}
+                    for h, q in pairs(state.availHolders[nm] or {}) do hs[#hs + 1] = ('%s:%d'):format(h, q) end
+                    printf_log('  group has %s (%d available: %s) - requesting.', nm, avail[nm], table.concat(hs, ', '))
                 end
             end
             if #toGet > 0 then
@@ -8932,7 +9123,12 @@ local function run_engine(job)
         do
             local preIngs = {}
             for nm, q in pairs(plan.buyDemand) do
-                preIngs[#preIngs + 1] = { name = nm, qty = q, buylast = plan.buyLast and plan.buyLast[nm] or false }
+                -- Only pre-buy what we're ACTUALLY still short of. The group hand-off just above may have
+                -- delivered part of buyDemand, so listing the stale demand printed 'Pre-buying N' then
+                -- immediately 'already have all' - contradictory. Re-check against what's on hand now.
+                if item_count(nm) < q then
+                    preIngs[#preIngs + 1] = { name = nm, qty = q, buylast = plan.buyLast and plan.buyLast[nm] or false }
+                end
             end
             if #preIngs > 0 then
                 printf_log('Pre-buying %d vendor mat type(s) in one pass to avoid repeat vendor trips...', #preIngs)
@@ -9407,19 +9603,27 @@ local function run_engine(job)
                 -- Champion Arrows, trivial 335, crafted at Fletching 300). Gate on job.leveling.
                 if job.stopOnTrivial and job.leveling then
                     local curSkill = skill_value(skillSec.Skill)
-                    -- Stop at the character's REAL cap, not a hardcoded 300. Some classes cap a skill
-                    -- below 300 (e.g. Paladins can't reach 300 Research) or need AAs to raise it, so
-                    -- chasing 300 would grind forever. SkillCap is the true, illusion-proof ceiling.
-                    local realCap = skillSec.Skill and (mq.TLO.Me.SkillCap(skillSec.Skill)() or 0) or 0
-                    if realCap <= 0 then realCap = HARD_SKILL_CAP end   -- fallback if the TLO is unavailable
-                    local stopAt = math.min(rec.trivial or HARD_SKILL_CAP, HARD_SKILL_CAP, realCap)
+                    -- Use the SAME ceiling the advance loop uses (state.level_skill_ceiling) so the two
+                    -- can NEVER disagree - the documented "prints 'stopping' but keeps re-queuing / grinds
+                    -- past the cap" bug. That helper already folds in the class SkillCap, any PATH_MAX_SKILL,
+                    -- and the hard 300 cap, so every tradeskill is gated identically. Stop at whichever comes
+                    -- first: this recipe going trivial, or the skill ceiling. (This also gates SUBCOMBINE
+                    -- combines routed through execute_recipe, not just the top product.)
+                    local ceiling = state.level_skill_ceiling(skillSec.Skill, job.skillName or skillSec.Skill)
+                    local stopAt = math.min(rec.trivial or ceiling, ceiling)
                     if curSkill and curSkill >= stopAt then
-                        if curSkill >= realCap and realCap < HARD_SKILL_CAP then
-                            printf_log("%s is at your class's cap (%d) - this is as high as you can raise it, stopping.",
-                                skillSec.Skill, realCap)
-                        elseif curSkill >= HARD_SKILL_CAP then
-                            printf_log('%s reached the skill cap (%d) - stopping.',
-                                skillSec.Skill, HARD_SKILL_CAP)
+                        if curSkill >= ceiling then
+                            -- Hit the skill ceiling - say WHICH kind: a class/path cap BELOW 300 (can't
+                            -- raise it further, not a bug or missing mats) vs the true 300 max. ceiling
+                            -- already folds in SkillCap + PATH_MAX + the hard 300, so ceiling < 300 means
+                            -- class/path-limited; ceiling == 300 means genuinely maxed.
+                            if ceiling < HARD_SKILL_CAP then
+                                printf_log("%s is at your class's cap (%d) - this is as high as you can raise it, stopping.",
+                                    skillSec.Skill, ceiling)
+                            else
+                                printf_log('%s reached the skill cap (%d) - stopping.',
+                                    skillSec.Skill, HARD_SKILL_CAP)
+                            end
                         else
                             printf_log('%s reached trivial (%d/%d) - stopping.',
                                 skillSec.Skill, curSkill, rec.trivial)
@@ -9823,48 +10027,6 @@ state.sell_between_recipes = function(prevEntry, nextEntry, nextRec, skillSec)
     do return end
 end
 
-state._sell_between_recipes_OLD = function(prevEntry, nextEntry, nextRec, skillSec)
-    -- nextEntry/nextRec are nil at a TERMINAL exit (hit the cap, out of mats, all trivial). There's
-    -- no next recipe to keep mats for, so `keep` stays empty and we sell the whole leaving tree.
-    -- Without this the last rung's leftovers rode along into the next skill path - the sell only ever
-    -- fired from the advance block, which never runs when the plan ends.
-    if not prevEntry then return end
-    -- Per-path "don't sell tradeskill ingredients": when ticked for the active path, leftover reagents
-    -- ride along instead of being vendored between rungs. Off by default for Blacksmithing (its bars
-    -- are worth keeping via SELL_NEVER anyway, but the path itself sells the rest).
-    if state.levelPathName and state.keepIngredients and state.keepIngredients[state.levelPathName] then
-        return
-    end
-    if nextEntry and nextRec and nextEntry.itemName == prevEntry.itemName then return end
-    local prevRec = get_recipe(prevEntry.itemName)
-    if not prevRec then return end
-
-    local keep = {}
-    if nextRec then
-        for _, nm in ipairs(state.collect_tree_mats(nextRec)) do keep[nm:upper()] = true end
-    end
-    -- Only sell CLUTTER: non-stackable AND vendor-sold (cheap molds/patterns/parts that each eat a
-    -- full bag slot). Stackable subcombine products (Jumjum Salad, Royal Mints, Picnic Basket...) and
-    -- anything no vendor sells are KEPT. This is the fix for the Misty Thicket Picnic wipe, where the
-    -- old "sell the whole tree" liquidated 30 minutes of stackable subcombines on a skipped recipe.
-    local toSell = {}
-    for _, nm in ipairs(state.collect_tree_mats(prevRec)) do
-        if not keep[nm:upper()] and item_count(nm) > 0 and state.is_clutter_item(nm) then
-            toSell[#toSell + 1] = { name = nm, qty = 1 }
-        end
-    end
-    if #toSell == 0 then return end
-
-    printf_log('Selling %d clutter type(s) (non-stackable vendor items) from %s...', #toSell, prevEntry.itemName)
-    -- Sell inline, then fall through to queue the next craft. (Deferring this as a separate sell
-    -- job stalled leveling: the sell-job path never re-entered the advance block to start the recipe.)
-    run_sell_reagents({
-        action = 'sell_reagents',
-        skillSection = skillSec,
-        recipe = { name = prevEntry.itemName, ingredients = toSell },
-    })
-end
-
 -- Standalone action: sell every ingredient (job.mode == 'ingredients') or every
 -- product (job.mode == 'products') across the whole level plan, in one merchant
 -- visit. Used by the Level tab's quick inventory-cleanup buttons. Reusable tools
@@ -9949,6 +10111,18 @@ end
 -- Early-outs (no banker trip) when nothing of itemName is banked, and falls through
 -- gracefully (returns current on-hand) if no banker is reachable, so the caller can ask
 -- the group for the remainder. Ported from TradeskillListener's proven bank routine.
+-- Lazy bank-bag opener (crafter side, mirrors the listener). rightmouseup TOGGLES with no memory, so
+-- re-opening the same bag per-grab was thrash. Open each bag we actually pull from ONCE per trip and
+-- remember it; reset on a fresh bank open. Non-stackables (e.g. the trophy) skip this - they grab
+-- straight from a closed bag (no split window to pop).
+state.bank_bag_opened = {}
+state.ensure_bank_bag_open = function(b)
+    if state.bank_bag_opened[b] then return end
+    mq.cmdf('/itemnotify bank%d rightmouseup', b); mq.delay(80)
+    state.bank_bag_opened[b] = true
+    printf_log('  (opened bank bag %d)', b)
+end
+
 state.bankTopUp = function(itemName, target)
     target = target or math.huge
     if item_count(itemName) >= target then return item_count(itemName) end
@@ -10007,6 +10181,7 @@ state.bankTopUp = function(itemName, target)
     if not mq.TLO.Window('BigBankWnd').Open() then
         mq.cmd('/click right target')
         mq.delay(1000, function() return mq.TLO.Window('BigBankWnd').Open() end)
+        state.bank_bag_opened = {}   -- fresh open: reset the per-trip opened-bag set
     end
     if not mq.TLO.Window('BigBankWnd').Open() then
         printf_log('Bank: could not open the bank window for %s.', itemName)
@@ -10024,7 +10199,9 @@ state.bankTopUp = function(itemName, target)
                 if slots > 0 then
                     for s = 1, slots do
                         if (bankSlot.Item(s).Name() or ''):upper() == upper then
-                            mq.cmdf('/nomodkey /itemnotify in bank%d %d leftmouseup', b, s)
+                            -- bankTopUp pulls the WHOLE slot stack (no split), so no bag open needed -
+                            -- a whole-stack grab works from a closed bag (baseline rule).
+                            mq.cmdf('/itemnotify in bank%d %d leftmouseup', b, s)
                             mq.delay(500, function() return (mq.TLO.Cursor.ID() or 0) > 0 or mq.TLO.Window('QuantityWnd').Open() end)
                             if mq.TLO.Window('QuantityWnd').Open() then
                                 mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
@@ -10450,25 +10627,6 @@ end
 -- "Cake Round" we could never pull. Falls back to FindItemBankCount ONLY when the regular bank isn't
 -- readable at all (no slot reports an ID), so a bank we can't see yet is never wrongly read as empty.
 -- FREE and accurate anytime on Laz (no bank trip needed to read).
--- Console-parse bank read. The Lua FindItemBankCount binding returns 0 on a CLOSED bank on this
--- build, but the SAME TLO via console parse (/echo ${FindItemBankCount[=X]}) reads a closed bank
--- fine (measured in-game: console prints 1 cold, the Lua call prints 0). So fire the echo and capture
--- the parsed number via a one-shot tagged event. Returns a number, or nil if the capture didn't land.
-state.bankEcho = state.bankEcho or {}
-mq.event('ts_bankecho', 'TSBANKECHO #1# #2#', function(_, tag, val)
-    if tag then state.bankEcho[tag] = tonumber(val) end
-end)
-state.bank_count_console = function(name)
-    local tag = 'B' .. tostring(math.floor(mq.gettime()) % 100000)
-    state.bankEcho[tag] = nil
-    mq.cmdf('/echo TSBANKECHO %s ${FindItemBankCount[=%s]}', tag, name)
-    local deadline = mq.gettime() + 600
-    while mq.gettime() < deadline and state.bankEcho[tag] == nil do
-        mq.doevents(); mq.delay(20)
-    end
-    return state.bankEcho[tag]   -- number, or nil if it never came back
-end
-
 state.bank_count = function(name)
     -- CACHE (closed bank only): with the window shut, contents can't change (no withdraw possible) and
     -- the read is a slow console echo. So cache per-name and each distinct item echoes just ONCE per
@@ -10505,20 +10663,62 @@ state.bank_count = function(name)
     if visible then
         result = total
     else
-        -- Bank closed / uncached: Me.Bank read nothing. The Lua FindItemBankCount binding also reads 0
-        -- cold on this build, so go through console parse (which does read a closed bank). Fall back to
-        -- the Lua TLO only if the console capture didn't come back at all.
-        local c = state.bank_count_console(name)
-        if c ~= nil then
-            result = c
-        else
-            local ok, n = pcall(function() return mq.TLO.FindItemBankCount('=' .. name)() end)
-            result = (ok and type(n) == 'number') and n or 0
-        end
+        -- Bank closed / uncached: Me.Bank read nothing. FindItemBankCount reads a CLOSED bank correctly
+        -- now (verified cold via /laztestbankread - the old build's '0 cold' bug is gone), so read it
+        -- straight from the TLO. No console-echo hack needed.
+        local ok, n = pcall(function() return mq.TLO.FindItemBankCount('=' .. name)() end)
+        result = (ok and type(n) == 'number') and n or 0
     end
     if not bankOpen then state._bankCache[name] = result end
     return result
 end
+
+-- TEST: /lazbagtest   -- Open bank bag slot 1 and withdraw its FIRST item, logging every gesture so we
+-- can see exactly which step lands (or doesn't land) the item in bags. Uses the crafter's proven
+-- open-bag-then-grab sequence (rightmouseup to open, then plain grab - NO /nomodkey). Run it standing
+-- at a banker with the slot-1 bank bag holding at least one item.
+mq.bind('/lazbagtest', function()
+    printf_log('=== /lazbagtest: bank slot 1, first item ===')
+    if not mq.TLO.Window('BigBankWnd').Open() then
+        printf_log('  bank closed - targeting banker + right-click...')
+        mq.cmd('/target npc banker'); mq.delay(700, function() return (mq.TLO.Target.ID() or 0) > 0 end)
+        mq.cmd('/click right target'); mq.delay(1500, function() return mq.TLO.Window('BigBankWnd').Open() end)
+    end
+    printf_log('  BigBankWnd.Open = %s', tostring(mq.TLO.Window('BigBankWnd').Open()))
+    if not mq.TLO.Window('BigBankWnd').Open() then printf_log('  cannot open bank - aborting.'); return end
+
+    local bag = mq.TLO.Me.Bank(1)
+    printf_log('  Bank(1): id=%d name=%q container_slots=%d', bag.ID() or 0, tostring(bag.Name() or ''), bag.Container() or 0)
+    if (bag.Container() or 0) < 1 then printf_log('  bank slot 1 is NOT a container/bag - aborting.'); return end
+    local iname = bag.Item(1).Name() or ''
+    if iname == '' then printf_log('  slot 1 of the bank bag is empty - aborting.'); return end
+    local before = item_count(iname)
+    printf_log('  first item = %q (stack %d).  bags before = %d, cursor = %d', iname, bag.Item(1).Stack() or 1, before, mq.TLO.Cursor.ID() or 0)
+
+    printf_log('  [1] /itemnotify bank1 rightmouseup   (open the bag)')
+    mq.cmd('/itemnotify bank1 rightmouseup'); mq.delay(350)
+
+    printf_log('  [2] /itemnotify in bank1 1 leftmouseup   (grab - no nomodkey)')
+    mq.cmd('/itemnotify in bank1 1 leftmouseup')
+    mq.delay(800, function() return (mq.TLO.Cursor.ID() or 0) > 0 or mq.TLO.Window('QuantityWnd').Open() end)
+    printf_log('      -> cursor=%d (%s)  QuantityWnd.Open=%s', mq.TLO.Cursor.ID() or 0, tostring(mq.TLO.Cursor.Name() or ''), tostring(mq.TLO.Window('QuantityWnd').Open()))
+
+    if mq.TLO.Window('QuantityWnd').Open() then
+        printf_log('  [3] split window popped - accepting whole amount')
+        mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
+        mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) > 0 end)
+        printf_log('      -> cursor=%d', mq.TLO.Cursor.ID() or 0)
+    end
+
+    if (mq.TLO.Cursor.ID() or 0) > 0 then
+        printf_log('  [4] /autoinventory   (stash to bags)')
+        mq.cmd('/autoinventory'); mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+    end
+
+    local after = item_count(iname)
+    printf_log('  RESULT: bags %d -> %d (delta %+d), cursor now=%d', before, after, after - before, mq.TLO.Cursor.ID() or 0)
+    printf_log(after > before and '  >>> SUCCESS: the item moved into bags.' or '  >>> FAIL: nothing landed - note the last step above that changed cursor/window state.')
+end)
 
 -- DIAG PROBE: /tsbankprobe <Encoded_Item>   e.g.  /tsbankprobe Denmother's_Rolling_Pin  (spaces as _)
 -- Read-only. Reports what every bank-read path sees for one item, so we can tell WHY a banked trophy
@@ -10786,6 +10986,7 @@ state.reach_and_open_bank = function()
     if not mq.TLO.Window('BigBankWnd').Open() then
         mq.cmd('/click right target')
         mq.delay(1000, function() return mq.TLO.Window('BigBankWnd').Open() end)
+        state.bank_bag_opened = {}   -- fresh open: reset the per-trip opened-bag set
     end
     if not mq.TLO.Window('BigBankWnd').Open() then
         printf_log('Bank: could not open the bank window.')
@@ -10850,11 +11051,12 @@ state.withdraw_count = function(name, n)
     local upper = name:upper()
     local before = item_count(name)
     clear_cursor()
-    mq.delay(100)
+    mq.delay(30)
 
     -- Find the item's bank slot (nested bag or top-level) and grab it. A plain grab pops the split
     -- window; the KEY is setting the amount via the TLO SetText method (NOT /notify settext, which is
     -- an invalid notification) - that was the "pulled the whole stack" bug all along.
+    local grabbedStack = 0   -- the grabbed slot's stack size (set by grab), decides split handling
     local function grab()
         for b = 1, 24 do
             local bag = mq.TLO.Me.Bank(b)
@@ -10863,13 +11065,16 @@ state.withdraw_count = function(name, n)
                 if slots > 0 then
                     for sidx = 1, slots do
                         if (bag.Item(sidx).Name() or ''):upper() == upper then
-                            -- The split window only pops if the bag is OPEN; closed bag -> whole stack.
-                            mq.cmdf('/itemnotify bank%d rightmouseup', b)   -- open the bank bag
-                            mq.delay(350)
+                            -- BASELINE RULE: only a PARTIAL pull of a stack needs the split window
+                            -- (bag open). A whole-stack pull, or a non-stackable (Stack()==1), grabs
+                            -- straight from a closed bag.
+                            grabbedStack = bag.Item(sidx).Stack() or 1
+                            if n < grabbedStack then state.ensure_bank_bag_open(b) end   -- partial opens; whole leaves the bag as-is
                             mq.cmdf('/itemnotify in bank%d %d leftmouseup', b, sidx); return true
                         end
                     end
                 elseif (bag.Name() or ''):upper() == upper then
+                    grabbedStack = bag.Stack() or 1
                     mq.cmdf('/itemnotify bank%d leftmouseup', b); return true
                 end
             end
@@ -10879,8 +11084,25 @@ state.withdraw_count = function(name, n)
     -- Restored to the simple version that pulled exactly 2, reliably (build -p): grab, wait for the
     -- split window, set the amount, accept. No retry/put-back loop (that regressed it).
     if not grab() then printf_log('Bank: could not locate %s to grab.', name); return 0 end
-    mq.delay(1000, function() return mq.TLO.Window('QuantityWnd').Open() or (mq.TLO.Cursor.ID() or 0) > 0 end)
+    -- GATE, don't flat-wait: proceed the instant the split window (or cursor) appears. If nothing
+    -- landed in a short beat, the bag opened late - re-fire the grab now that it's surely open, then
+    -- gate again. Self-correcting, so the ensure-open delay stays short and the fast case is fast.
+    mq.delay(800, function() return mq.TLO.Window('QuantityWnd').Open() or (mq.TLO.Cursor.ID() or 0) > 0 end)
+    -- Re-grab ONLY on a TOTAL miss (nothing landed at all - bag opened late / was closed), not just
+    -- because the split window is slow. The old eager short-gate re-grabbed on every partial and cost
+    -- an extra round-trip each time.
+    if not mq.TLO.Window('QuantityWnd').Open() and (mq.TLO.Cursor.ID() or 0) == 0 then
+        grab()
+        mq.delay(800, function() return mq.TLO.Window('QuantityWnd').Open() or (mq.TLO.Cursor.ID() or 0) > 0 end)
+    end
     if mq.TLO.Window('QuantityWnd').Open() then
+      if n >= grabbedStack then
+        -- WHOLE stack: accept the split's DEFAULT (the full stack), the way TurboGive's
+        -- HandleBankQuantityWindow does. SetText-ing n>=stack just fails the slider max and
+        -- cancels (the 'reads 995' bug).
+        mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
+        mq.delay(500, function() return not mq.TLO.Window('QuantityWnd').Open() end)
+      else
         -- Set the amount, then WAIT until the field actually reads n before accepting (accepting early
         -- takes the full-stack default - that was the bug). Issue the /invoke ONCE, then poll the cheap
         -- text read; only re-issue occasionally if it hasn't committed. The extra /invoke calls were
@@ -10888,12 +11110,12 @@ state.withdraw_count = function(name, n)
         local want = tostring(n)
         local set = false
         mq.cmdf('/invoke ${Window[QuantityWnd/QTYW_SliderInput].SetText[%d]}', n)
-        local deadline, ticks = mq.gettime() + 1500, 0
+        local deadline, ticks = mq.gettime() + 1200, 0
         repeat
             if (mq.TLO.Window('QuantityWnd/QTYW_SliderInput').Text() or '') == want then set = true; break end
-            mq.delay(40)
+            mq.delay(25)
             ticks = ticks + 1
-            if ticks % 8 == 0 then   -- ~every 320ms, nudge it again if it hasn't taken
+            if ticks % 6 == 0 then   -- ~every 150ms, nudge it again if it hasn't taken
                 mq.cmdf('/invoke ${Window[QuantityWnd/QTYW_SliderInput].SetText[%d]}', n)
             end
         until mq.gettime() > deadline
@@ -10905,13 +11127,19 @@ state.withdraw_count = function(name, n)
             return 0
         end
         mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
-        mq.delay(600, function() return (mq.TLO.Cursor.ID() or 0) > 0 end)
+        mq.delay(500, function() return (mq.TLO.Cursor.ID() or 0) > 0 end)
+      end
     end
     if (mq.TLO.Cursor.ID() or 0) > 0 then
         mq.cmd('/autoinventory')
-        mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+        mq.delay(300, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
     end
-    clear_cursor()   -- leave the cursor empty so the NEXT pull doesn't start dirty (and slow)
+    -- Plain cursor top-up, NOT the full clear_cursor: its stacked-desync settle adds a fixed 2s meant
+    -- for rapid salvage stows, not a single clean bank withdraw. The /autoinventory above already
+    -- emptied the cursor in the common case; this just catches a straggler cheaply.
+    if (mq.TLO.Cursor.ID() or 0) > 0 then
+        mq.cmd('/autoinventory'); mq.delay(600, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+    end
     local got = item_count(name) - before
     printf_log('Withdrew %d x %s (asked %d).', got, name, n)
     return got
@@ -14668,12 +14896,42 @@ local function render_window()
                     state.help_marker('Applied in Felwithe and Jaggedpine to help with faction. If this does not help, consider using an alt to purchase instead.')
                     ImGui.Spacing()
                     do
-                        local s = ImGui.InputText('Spell (mems gem 8 + casts)##ts_set_illu_spell', state.illusionSpell or '', 64)
-                        if s ~= state.illusionSpell then state.illusionSpell = s; state.save_settings() end
-                        local it = ImGui.InputText('Item (/useitem)##ts_set_illu_item', state.illusionItem or '', 64)
-                        if it ~= state.illusionItem then state.illusionItem = it; state.save_settings() end
-                        local aa = ImGui.InputText('AA (/aa act)##ts_set_illu_aa', state.illusionAA or '', 64)
-                        if aa ~= state.illusionAA then state.illusionAA = aa; state.save_settings() end
+                        ImGui.SetNextItemWidth(220)
+                        local nm = ImGui.InputText('Name##ts_set_illu_name', state.illusionName or '', 64)
+                        if nm ~= state.illusionName then state.illusionName = nm; state.save_settings() end
+                        ImGui.SetNextItemWidth(120)
+                        local cur = state.illusionType
+                        if cur ~= 'Spell' and cur ~= 'Item' and cur ~= 'AA' then cur = 'Spell' end
+                        if ImGui.BeginCombo('Type##ts_set_illu_type', cur) then
+                            for _, t in ipairs({ 'Spell', 'Item', 'AA' }) do
+                                if ImGui.Selectable(t .. '##illu_ty_' .. t, cur == t) then
+                                    if state.illusionType ~= t then state.illusionType = t; state.save_settings() end
+                                end
+                            end
+                            ImGui.EndCombo()
+                        end
+                    end
+
+                    ImGui.Spacing()
+                    ImGui.Text('Shrink (optional)')
+                    ImGui.SameLine()
+                    state.help_marker('Default is no shrink. Enter a Name and pick its Type - Spell (mems gem 8 + casts), Item (/useitem, only fires if you are carrying it), or AA (/aa act). Applied once per zone before a vendor/station approach to fit tight geometry. Blank Name = never pause to shrink.')
+                    ImGui.Spacing()
+                    do
+                        ImGui.SetNextItemWidth(220)
+                        local nm = ImGui.InputText('Name##ts_set_shrink_name', state.shrinkName or '', 64)
+                        if nm ~= state.shrinkName then state.shrinkName = nm; state.save_settings() end
+                        ImGui.SetNextItemWidth(120)
+                        local cur = state.shrinkType
+                        if cur ~= 'Spell' and cur ~= 'Item' and cur ~= 'AA' then cur = 'Item' end
+                        if ImGui.BeginCombo('Type##ts_set_shrink_type', cur) then
+                            for _, t in ipairs({ 'Spell', 'Item', 'AA' }) do
+                                if ImGui.Selectable(t .. '##shrink_ty_' .. t, cur == t) then
+                                    if state.shrinkType ~= t then state.shrinkType = t; state.save_settings() end
+                                end
+                            end
+                            ImGui.EndCombo()
+                        end
                     end
 
                     ImGui.Spacing()
@@ -14964,6 +15222,189 @@ pcall(function() mq.bind('/tsreq', function(mode, ...)
     state.pendingJob = { action = 'request', requests = { { item = item, mode = mode } } }
 end) end)
 
+-- Deposit the whole inventory stack of `name` back into a bank bag (keeps it in a bag for the next
+-- test round). Used only by /laztestbank.
+state.test_deposit = function(name)
+    if item_count(name) <= 0 then printf_log('  deposit: no %s in bags', name); return end
+    mq.cmdf('/itemnotify "%s" leftmouseup', name)
+    mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) > 0 or mq.TLO.Window('QuantityWnd').Open() end)
+    if mq.TLO.Window('QuantityWnd').Open() then   -- stackable pickup pops a split; take the whole stack
+        mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
+        mq.delay(500, function() return (mq.TLO.Cursor.ID() or 0) > 0 end)
+    end
+    if (mq.TLO.Cursor.ID() or 0) == 0 then printf_log('  deposit: could not pick up %s', name); return end
+    -- Stow via the bank window's Auto button (BIGB_AutoButton) - the gesture TurboLoot uses. The
+    -- /autobank COMMAND doesn't work on Laz, but clicking the bank's Auto button with the item on the
+    -- cursor auto-deposits it (finds a home itself, no bag to open). Retry once if it doesn't settle.
+    mq.cmd('/notify BigBankWnd BIGB_AutoButton leftmouseup')
+    mq.delay(800, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+    if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+        mq.cmd('/notify BigBankWnd BIGB_AutoButton leftmouseup')
+        mq.delay(600, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+    end
+    if (mq.TLO.Cursor.ID() or 0) == 0 then printf_log('  deposit: %s -> bank (Auto button)', name)
+    else printf_log('  deposit: bank Auto button did not stow %s (still on cursor)', name) end
+end
+
+-- TEST: /laztestbank [stackItem] [trophyItem] [rounds]  (defaults: Powder of Ro / Blacksmithing Trophy / 2)
+-- Withdraws 5 (partial), then a whole stack, then the trophy, then deposits all back - N rounds. Watch for
+-- '(opened bank bag N)': it should appear for the PARTIAL pull only, NOT the whole-stack or trophy pulls.
+-- TEST: /laztestdq <peer> <item name>   e.g. /laztestdq Hezalo Powder of Ro
+-- Reads the peer's count of that item via DanNet and reports it + the round-trip time. Try it with a
+-- spacey name AND an apostrophe name (Kerafyrm's Bite XIII) to prove DanNet passes them cleanly.
+mq.bind('/laztestdq', function(peer, ...)
+    local itemName = table.concat({...}, ' ')
+    if not peer or peer == '' or itemName == '' then
+        printf_log('/laztestdq: usage  /laztestdq <peer> <item name>'); return
+    end
+    printf_log('=== /laztestdq: ask %s for FindItemCount[=%s] ===', peer, itemName)
+    local t0 = mq.gettime()
+    local n = state.peer_item_count(peer, itemName)
+    local dt = mq.gettime() - t0
+    if n < 0 then
+        printf_log('  NO RESULT after %dms - DanNet did not return it (bad name escape or peer down). Listener stays for this.', dt)
+    else
+        printf_log('  %s has %d x %s   (via DanNet, %dms)', peer, n, itemName, dt)
+    end
+end)
+
+-- TEST: /laztestgroup <item name>   e.g. /laztestgroup Powder of Ro
+-- Queries every same-zone mule for that item via DanNet, two ways: (1) serial per-mule peer_item_count
+-- (shows each mule's count + round-trip ms), and (2) the batched PARALLEL peer_item_counts that
+-- group_check actually uses (shows total, holders, and total ms). Verify the counts match what the
+-- mules really hold, and that the parallel path is fast.
+-- TEST: /laztestcrosszone <item name>   e.g. /laztestcrosszone Velium Bar
+-- Runs the cross-zone QUERY + holder-resolution only - NO travel, NO delivery. Reads every network
+-- peer's zone (live /dquery), filters to reachable hubs other than ours, DanNet-queries them (bags+bank),
+-- and prints who holds it + where + the best pick. Safe to spam - it never moves the crafter.
+-- TEST: /laztestbankread <item name>   run with the bank CLOSED (fresh-zoned, no bank trip)
+-- Sanity-check the crafter's OWN cold-bank read: the direct Lua TLO [1] is what bank_count now uses
+-- (verified reading a closed bank correctly); [2] is a DanNet self-query for comparison. Both should
+-- match what's actually banked.
+mq.bind('/laztestbankread', function(...)
+    local name = table.concat({...}, ' ')
+    if name == '' then printf_log('usage: /laztestbankread <item name>  (run with bank CLOSED)'); return end
+    local bankOpen = mq.TLO.Window('BigBankWnd').Open()
+    printf_log('=== /laztestbankread: "%s"  (bank is %s) ===', name, bankOpen and 'OPEN' or 'CLOSED')
+    if bankOpen then printf_log('  NOTE: bank is OPEN - close it and re-run to test the cold-read path.') end
+    -- 1) plain Lua binding (the one that reads 0 cold on this build)
+    local okL, luaN = pcall(function() return mq.TLO.FindItemBankCount('='..name)() end)
+    printf_log('  [1] Lua mq.TLO.FindItemBankCount = %s', okL and tostring(luaN) or 'ERR')
+    -- 2) DanNet query to OURSELF (comparison)
+    local me = (mq.TLO.Me.Name() or ''):lower()
+    local t0 = mq.gettime()
+    local dN = state.dannet_query(me, string.format('FindItemBankCount[=%s]', name), 2000)
+    printf_log('  [2] DanNet self-query (%s)       = %s  (%dms)', me, (dN == '') and 'NO REPLY' or dN, mq.gettime() - t0)
+    printf_log('  -> both should equal the real banked count.')
+end)
+
+mq.bind('/laztestcrosszone', function(...)
+    local item = table.concat({...}, ' ')
+    if item == '' then printf_log('usage: /laztestcrosszone <item name>'); return end
+    local origin = current_zone()
+    printf_log('=== /laztestcrosszone: "%s"  (we are in %s) ===', item, origin)
+    local allPeers = state.all_network_peers()
+    printf_log('  %d network peer(s): %s', #allPeers, table.concat(allPeers, ', '))
+    if #allPeers == 0 then printf_log('  no network peers (DanNet down?)'); return end
+    -- live zones for all peers
+    local t0 = mq.gettime()
+    local zones = state.query_peer_zones(allPeers)
+    printf_log('  zone read: %dms', mq.gettime() - t0)
+    local peers, peerZone = {}, {}
+    for _, pr in ipairs(allPeers) do
+        local z = zones[pr]
+        local reachable = z and state.CROSS_ZONES[z] and z ~= origin
+        printf_log('    %s -> zone=%s  %s', pr, tostring(z or '?'), reachable and '(REACHABLE)' or (z == origin and '(our zone)' or '(not a hub)'))
+        if reachable then peers[#peers + 1] = pr; peerZone[pr] = z end
+    end
+    if #peers == 0 then printf_log('  no reachable cross-zone peer to ask.'); return end
+    -- DanNet item sweep (bags+bank) - same call the real path uses
+    local t1 = mq.gettime()
+    state.peer_item_counts(peers, { item })
+    printf_log('  item sweep: %dms', mq.gettime() - t1)
+    local best, bestZone, bestQty = nil, nil, 0
+    local anyHolder = false
+    for holder, qty in pairs(state.availHolders[item] or {}) do
+        anyHolder = true
+        local hz = peerZone[holder] or peerZone[tostring(holder):lower()]
+        printf_log('    holder %s = %d  (zone %s)', holder, qty, tostring(hz or '?'))
+        if hz and (qty or 0) > bestQty then best, bestZone, bestQty = holder, hz, qty end
+    end
+    if not anyHolder then printf_log('  no reachable peer holds %s.', item)
+    elseif best then printf_log('  BEST PICK: %s in %s with %d (this is who the real run would travel to)', best, bestZone, bestQty)
+    else printf_log('  holders found but none in a resolvable zone (investigate).') end
+end)
+
+mq.bind('/laztestgroup', function(...)
+    local raw = table.concat({...}, ' ')
+    if raw == '' then printf_log('usage: /laztestgroup <item>   OR   <item1>|<item2>|...   (| separates items)'); return end
+    -- Split on | for MULTI-item: this reproduces the group_check batch that misattributed holders.
+    local items = {}
+    for it in raw:gmatch('([^|]+)') do
+        it = it:gsub('^%s+',''):gsub('%s+$','')
+        if it ~= '' then items[#items + 1] = it end
+    end
+    local mules = state.same_zone_peers()
+    printf_log('=== /laztestgroup: %d item(s) across %d same-zone mule(s) ===', #items, #mules)
+    if #mules == 0 then printf_log('  no same-zone mules (DanNet up? mules in YOUR zone?)'); return end
+    -- GROUND TRUTH: serial per-mule per-item (each query fully isolated - can't misattribute).
+    local serial = {}
+    for _, it in ipairs(items) do
+        serial[it] = 0
+        for _, m in ipairs(mules) do
+            local n = state.peer_item_count(m, it)
+            if n > 0 then serial[it] = serial[it] + n; printf_log('  [serial] %s has %d %s', m, n, it) end
+        end
+    end
+    -- BATCH: exactly what group_check uses (state.peer_item_counts on the whole item list). The holders
+    -- printed here are what delivery would target - compare against the serial ground truth above.
+    local avail = state.peer_item_counts(mules, items)
+    for _, it in ipairs(items) do
+        local hs = {}
+        for h, q in pairs(state.availHolders[it] or {}) do hs[#hs + 1] = ('%s:%d'):format(h, q) end
+        local ptot = avail[it] or 0
+        local flag = (ptot == (serial[it] or 0)) and 'OK' or ('** MISMATCH (serial total=' .. (serial[it] or 0) .. ')')
+        printf_log('  [batch] %s: total=%d holders=[%s]  %s', it, ptot, table.concat(hs, ', '), flag)
+    end
+end)
+
+mq.bind('/laztestbank', function(a1, a2, a3)
+    local stackName  = (a1 ~= nil and a1 ~= '') and a1 or 'Powder of Ro'
+    local trophyName = (a2 ~= nil and a2 ~= '') and a2 or 'Blacksmithing Trophy'
+    local rounds     = tonumber(a3) or 2
+    printf_log('=== /laztestbank: %s (5 + whole) + %s, %d round(s) ===', stackName, trophyName, rounds)
+    -- Start from a KNOWN state: close the bank if open (bags close with it), then open fresh so the
+    -- opened-set is reset to MATCH reality. A stale set made ensure_bank_bag_open re-toggle an
+    -- already-open bag SHUT between rounds - that was [a] grabbing the whole stack in round 2.
+    if mq.TLO.Window('BigBankWnd').Open() then
+        mq.cmd('/notify BigBankWnd DoneButton leftmouseup')
+        mq.delay(700, function() return not mq.TLO.Window('BigBankWnd').Open() end)
+    end
+    if not state.reach_and_open_bank() then printf_log('  could not open bank - aborting.'); return end
+    local pa, pb, pc, tTotal = 0, 0, 0, 0   -- pass counts per step + total time
+    for r = 1, rounds do
+        local t0 = mq.gettime()
+        printf_log('--- round %d/%d ---', r, rounds)
+        printf_log('[a] withdraw 5 x %s   (PARTIAL -> expect an open)', stackName)
+        local ta = mq.gettime(); local ga = state.withdraw_count(stackName, 5); ta = mq.gettime() - ta
+        printf_log('[b] withdraw a WHOLE stack of %s   (expect NO open; accept split default)', stackName)
+        local tb = mq.gettime(); local gb = state.withdraw_count(stackName, 1000000); tb = mq.gettime() - tb
+        printf_log('[c] withdraw 1 x %s   (non-stackable -> expect NO open)', trophyName)
+        local tc = mq.gettime(); local gc = state.withdraw_count(trophyName, 1); tc = mq.gettime() - tc
+        printf_log('[d] depositing everything back...')
+        state.test_deposit(trophyName)
+        state.test_deposit(stackName)
+        if ga == 5 then pa = pa + 1 else printf_log('  ** [a] FAIL: got %d (want 5)', ga) end
+        if gb > 0 then pb = pb + 1 else printf_log('  ** [b] FAIL: got %d (want a full stack)', gb) end
+        if gc == 1 then pc = pc + 1 else printf_log('  ** [c] FAIL: got %d (want 1)', gc) end
+        local dt = mq.gettime() - t0; tTotal = tTotal + dt
+        printf_log('round %d: %dms total  [a]%dms [b]%dms [c]%dms  (a=%d b=%d c=%d)', r, dt, ta, tb, tc, ga, gb, gc)
+    end
+    mq.cmd('/notify BigBankWnd DoneButton leftmouseup')
+    printf_log('=== SUMMARY: %d round(s) | [a] partial %d/%d | [b] whole %d/%d | [c] trophy %d/%d | avg round %dms ===',
+        rounds, pa, rounds, pb, rounds, pc, rounds, (rounds > 0) and math.floor(tTotal / rounds) or 0)
+end)
+
 pcall(function() mq.bind('/lazbank', function(action, ...)
     if state.busy then printf('\ar[Tradeskill]\ax busy - try again when idle.'); return end
     action = (action or ''):lower()
@@ -15035,7 +15476,8 @@ while state.running do
         elseif job.action == 'buy_jaggedpine' then
             state.run_buy_jaggedpine(job)
         elseif job.action == 'destroy_all' then
-            run_destroy_all_engine(job)
+            local okD, errD = pcall(run_destroy_all_engine, job)
+            if (not okD) and not tostring(errD):find('__TS_STOP__', 1, true) then error(errD) end
         elseif job.action == 'fish' then
             state.run_fish_engine(job)
         elseif job.action == 'booze' then
@@ -15068,19 +15510,21 @@ while state.running do
         elseif job.action == 'research' then
             local origAmmo = mq.TLO.Me.Inventory('ammo').Name() or ''
             state.equip_modifier(state.tsModifier)   -- seat the modifier (e.g. Ethereal Quill) before combines
-            run_research_engine(job)
+            local okRsr, errRsr = pcall(run_research_engine, job)
             if (mq.TLO.Me.Inventory('ammo').Name() or '') ~= origAmmo then   -- put your ammo item back on ANY exit
                 state.savedSlots = { ammo = origAmmo }
                 state.restore_saved_slots()
             end
+            if (not okRsr) and not tostring(errRsr):find('__TS_STOP__', 1, true) then error(errRsr) end
         elseif job.action == 'research_kit' then
             local origAmmo = mq.TLO.Me.Inventory('ammo').Name() or ''
             state.equip_modifier(state.tsModifier)   -- seat the modifier before combines
-            run_research_kit(job)
+            local okKit, errKit = pcall(run_research_kit, job)
             if (mq.TLO.Me.Inventory('ammo').Name() or '') ~= origAmmo then
                 state.savedSlots = { ammo = origAmmo }
                 state.restore_saved_slots()
             end
+            if (not okKit) and not tostring(errKit):find('__TS_STOP__', 1, true) then error(errKit) end
         elseif job.action == 'travel' then
             if job.dest == 'thurgadin' then
                 travel_to_thurgadin()
@@ -15106,7 +15550,13 @@ while state.running do
                 printf_log('Dev travel: unknown destination "%s".', tostring(job.dest))
             end
         else
-            run_engine(job)
+            -- Guard: a Stop during the pre-craft SUPPLY phase (ask_and_pull -> request_supply_grouped
+            -- -> check_stop) throws __TS_STOP__ from OUTSIDE the crafting loop's own pcall. Without this
+            -- guard it bubbled to the main chunk and killed the WHOLE script instead of aborting the job.
+            local okRun, runErr = pcall(run_engine, job)
+            if (not okRun) and not tostring(runErr):find('__TS_STOP__', 1, true) then
+                error(runErr)
+            end
             -- If running a queue, advance to next entry
             if state.queueRunning and not state.stopRequested then
                 state.currentQueueIndex = state.currentQueueIndex + 1

@@ -196,7 +196,7 @@ local PATH_MAX_SKILL = {
 local HARD_SKILL_CAP = 300
 
 local UI = {
-    round = 8,
+    round = 0,   -- 0 = crisp square corners (EQ look); was 8 (rounded)
     btn_w = 100,
     btn_h = 26,
     green = { 0.28, 0.62, 0.42, 1.0 },
@@ -208,7 +208,7 @@ local UI = {
 
 local state = {
     VERSION = '1.01',                              -- release version, shown in the title bar
-    BUILD_TAG = 'withdraw-recovery-retry-2026-07-19',            -- release marker (log header + Settings = stale-copy check)
+    BUILD_TAG = 'dannet-first-2026-07-22',            -- release marker (log header + Settings = stale-copy check)
     running = true,
     windowOpen = true,
     wasOpen = true,
@@ -937,15 +937,24 @@ state.peerKind = nil
 state.peer_cmdf = function(char, fmt, ...)
     local cmd = fmt:format(...)
     if not state.peerKind then
-        if mq.TLO.Plugin('mq2mono')() then
+        -- Prefer DanNet: its echo can be silenced (/dnet localecho/commandecho off) and E3N rides on it anyway.
+        -- Ensure it's actually loaded first; only fall back to E3/EQBC if DanNet can't be brought up.
+        local dnet = mq.TLO.Plugin('MQ2DanNet')() ~= nil
+        if not dnet then pcall(function() mq.cmd('/plugin mq2dannet load') end); mq.delay(750); dnet = mq.TLO.Plugin('MQ2DanNet')() ~= nil end
+        if dnet then
+            state.peerKind = 'dannet'
+            pcall(function() mq.cmd('/squelch /dnet localecho off') end)
+            pcall(function() mq.cmd('/squelch /dnet commandecho off') end)
+            printf_log('Peer network: DanNet (/dex).')
+        elseif mq.TLO.Plugin('mq2mono')() then
             state.peerKind = 'e3'
-            printf_log('Peer network: E3 (/e3bct).')
+            printf_log('Peer network: E3 (/e3bct) [DanNet unavailable].')
         elseif mq.TLO.Plugin('MQ2EQBC')() then
             state.peerKind = 'eqbc'
-            printf_log('Peer network: EQBC (/bct).')
+            printf_log('Peer network: EQBC (/bct) [DanNet unavailable].')
         else
             state.peerKind = 'dannet'
-            printf_log('Peer network: DanNet (/dex).')
+            printf_log('Peer network: DanNet (/dex) [unverified].')
         end
     end
     if state.peerKind == 'e3' then
@@ -12374,7 +12383,7 @@ local function draw_recipe_preview(rec, qty)
         return
     end
     ImGui.Text(string.format('Yield per combine: %d', rec.yield))
-    if ImGui.BeginTable('##ts_ing', 3, ImGuiTableFlags.Borders or 0, 0, 0) then
+    if ImGui.BeginTable('##ts_ing', 3, (ImGuiTableFlags.Borders or 0) + (ImGuiTableFlags.RowBg or 0), 0, 0) then
         ImGui.TableSetupColumn('Ingredient', ImGuiTableColumnFlags.WidthStretch)
         ImGui.TableSetupColumn('Per Combine', ImGuiTableColumnFlags.WidthFixed, 90)
         ImGui.TableSetupColumn('Total Needed', ImGuiTableColumnFlags.WidthFixed, 100)
@@ -12417,7 +12426,7 @@ local function draw_recipe_preview(rec, qty)
         end
         local c = state._costCache
         if c and c.items > 0 then
-            if ImGui.BeginTable('##ts_ing_cost', 2, ImGuiTableFlags.Borders or 0, 0, 0) then
+            if ImGui.BeginTable('##ts_ing_cost', 2, (ImGuiTableFlags.Borders or 0) + (ImGuiTableFlags.RowBg or 0), 0, 0) then
                 ImGui.TableSetupColumn('', ImGuiTableColumnFlags.WidthStretch)
                 ImGui.TableSetupColumn('', ImGuiTableColumnFlags.WidthFixed, 110)
                 ImGui.TableNextRow()
@@ -12901,6 +12910,11 @@ local function render_window()
     end
 
     local styleVars, styleCols = push_ui_style()
+    pcall(function()   -- keep the window from being dragged into an unreadable sliver
+        if ImGui.SetNextWindowSizeConstraints then
+            ImGui.SetNextWindowSizeConstraints(ImVec2(360, 280), ImVec2(4000, 4000))
+        end
+    end)
     local open, shouldDraw = ImGui.Begin('LazCraft  [' .. (state.VERSION or '?') .. ']###tradeskill_suite_ui', state.windowOpen)
     state.windowOpen = open
     state.wasOpen = open
@@ -12940,6 +12954,26 @@ local function render_window()
                     end
                 end
                 ImGui.SameLine()
+                do   -- status lamp: green running / amber-pulse paused / grey idle
+                    local lr, lg, lb = 0.42, 0.42, 0.42
+                    if running then
+                        if state.paused then
+                            local t = 0.4 + 0.6 * math.abs(math.sin(mq.gettime() / 350))
+                            lr, lg, lb = 0.95 * t, 0.72 * t, 0.20 * t
+                        else
+                            lr, lg, lb = 0.36, 0.80, 0.46
+                        end
+                    end
+                    pcall(function()
+                        local dl = ImGui.GetWindowDrawList()
+                        local cx, cy = ImGui.GetCursorScreenPos()
+                        local c = ImGui.GetColorU32(ImVec4(lr, lg, lb, 1))
+                        local ok = pcall(function() dl:AddRectFilled(ImVec2(cx + 1, cy + 3), ImVec2(cx + 11, cy + 13), c, 0, 0) end)
+                        if not ok then dl:AddRectFilled(cx + 1, cy + 3, cx + 11, cy + 13, c) end
+                    end)
+                    ImGui.Dummy(13, 16)
+                    ImGui.SameLine()
+                end
                 if running then
                     if state.paused then
                         ImGui.TextColored(0.98, 0.84, 0.28, 1.0, 'PAUSED')
@@ -15181,6 +15215,63 @@ local function render_window()
             ImGui.TextColored(0.95, 0.35, 0.35, 1.0, 'UI error: ' .. tostring(drawErr))
         end
     end
+
+    -- EQ-style double-hairline frame around the window (drawn last, over the content). Fully pcall-guarded
+    -- and tries BOTH draw-list API shapes (ImVec2 args / raw-number args) plus both color forms, so it can
+    -- never break the UI even if this MQ build's ImGui binding differs - worst case the frame just doesn't
+    -- appear. Retint via the two colors below (deep outline + twin rules); gap is the +1 / +3 insets.
+    pcall(function()
+        if not (ImGui.GetWindowDrawList and ImGui.GetColorU32 and ImGui.GetWindowPos and ImGui.GetWindowSize) then return end
+        local dl = ImGui.GetWindowDrawList()
+        local px, py = ImGui.GetWindowPos()
+        local sx, sy = ImGui.GetWindowSize()
+        local x1, y1, x2, y2 = px, py, px + sx, py + sy
+        local function C(r, g, b)
+            local ok, v = pcall(function() return ImGui.GetColorU32(ImVec4(r, g, b, 1)) end)
+            if ok then return v end
+            return ImGui.GetColorU32(r, g, b, 1)
+        end
+        local function R(a, b, c, d, col)
+            local ok = pcall(function() dl:AddRect(ImVec2(a, b), ImVec2(c, d), col, 0, 0, 1) end)
+            if not ok then pcall(function() dl:AddRect(a, b, c, d, col, 0, 0, 1) end) end
+        end
+        local function L(a, b, c, d, col)
+            local ok = pcall(function() dl:AddLine(ImVec2(a, b), ImVec2(c, d), col, 1) end)
+            if not ok then pcall(function() dl:AddLine(a, b, c, d, col, 1) end) end
+        end
+        local function FILL(a, b, c, d, col)
+            local ok = pcall(function() dl:AddRectFilled(ImVec2(a, b), ImVec2(c, d), col, 0, 0) end)
+            if not ok then pcall(function() dl:AddRectFilled(a, b, c, d, col) end) end
+        end
+
+        -- twin-rule colour: teal-grey normally; pulses toward amber while PAUSED (attention cue)
+        local rr, gg, bb = 0.227, 0.298, 0.333
+        if state.paused then
+            local t = 0.5 + 0.5 * math.abs(math.sin(mq.gettime() / 350))   -- gentle 0.5..1 pulse
+            rr = 0.227 + (0.85 - 0.227) * t
+            gg = 0.298 + (0.62 - 0.298) * t
+            bb = 0.333 + (0.20 - 0.333) * t
+        end
+        local ink  = C(0.016, 0.031, 0.039)   -- deep outer outline
+        local rule = C(rr, gg, bb)            -- the twin hairlines (amber-pulsing when paused)
+        R(x1,     y1,     x2,     y2,     ink)    -- deep outline
+        R(x1 + 1, y1 + 1, x2 - 1, y2 - 1, rule)   -- outer rule
+        R(x1 + 3, y1 + 3, x2 - 3, y2 - 3, rule)   -- inner rule (2px gap)
+
+        -- teal accent line just under the title bar
+        local tbh = 22
+        pcall(function() local h = ImGui.GetFrameHeight(); if h and h > 0 then tbh = h end end)
+        L(x1 + 4, y1 + tbh, x2 - 4, y1 + tbh, C(0.31, 0.69, 0.77))
+
+        -- small anvil mark, placed just AFTER the title text so it never overlaps the label or the X
+        local tw = 60
+        pcall(function() local w = ImGui.CalcTextSize('LazCraft  [' .. (state.VERSION or '?') .. ']'); if w then tw = w end end)
+        local ax, ay = x1 + 12 + tw + 10, y1 + 6
+        local metal = C(0.55, 0.62, 0.66)
+        FILL(ax,     ay,     ax + 13, ay + 3, metal)   -- anvil face
+        FILL(ax + 4, ay + 3, ax + 8,  ay + 6, metal)   -- waist
+        FILL(ax + 1, ay + 6, ax + 12, ay + 9, metal)   -- base
+    end)
 
     ImGui.End()
     pop_ui_style(styleVars, styleCols)

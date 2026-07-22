@@ -1,6 +1,6 @@
 local mq = require('mq')
 
-local BUILD_TAG = 'tsl-withdraw-speed-2026-07-19'   -- bump on every change; prints in the log header
+local BUILD_TAG = 'tsl-dannet-first-2026-07-22'   -- bump on every change; prints in the log header
 
 local running = true
 -- Items queued by /ts_qadd, delivered as one batch on /ts_qrun (one bank trip, one trade window).
@@ -105,7 +105,13 @@ local peerKind
 local function peer_cmdf(char, fmt, ...)
     local cmd = fmt:format(...)
     if not peerKind then
-        if mq.TLO.Plugin('mq2mono')() then peerKind = 'e3'
+        local dnet = mq.TLO.Plugin('MQ2DanNet')() ~= nil
+        if not dnet then pcall(function() mq.cmd('/plugin mq2dannet load') end); mq.delay(750); dnet = mq.TLO.Plugin('MQ2DanNet')() ~= nil end
+        if dnet then
+            peerKind = 'dannet'
+            pcall(function() mq.cmd('/squelch /dnet localecho off') end)
+            pcall(function() mq.cmd('/squelch /dnet commandecho off') end)
+        elseif mq.TLO.Plugin('mq2mono')() then peerKind = 'e3'
         elseif mq.TLO.Plugin('MQ2EQBC')() then peerKind = 'eqbc'
         else peerKind = 'dannet' end
         log('Peer network: %s', peerKind == 'e3' and 'E3 (/e3bct)' or peerKind == 'eqbc' and 'EQBC (/bct)' or 'DanNet (/dex)')

@@ -208,7 +208,7 @@ local UI = {
 
 local state = {
     VERSION = '1.01',                              -- release version, shown in the title bar
-    BUILD_TAG = 'dannet-first-2026-07-22',            -- release marker (log header + Settings = stale-copy check)
+    BUILD_TAG = 'trophies-alchemy-tinkering-2026-07-23',            -- release marker (log header + Settings = stale-copy check)
     running = true,
     windowOpen = true,
     wasOpen = true,
@@ -10437,8 +10437,8 @@ end
 -- carry no Skill= field). Each trophy seats in the Ammo slot (same as the research quill) and
 -- is REQUIRED once the matching skill is past 300; those high-trivial combines can't be made
 -- without it. `skill` is the [Skill:x] section name; the live EQ skill is read via that
--- section's Skill= value. Containers with no trophy (Medicine Bag/Alchemy, Spell Research Kit,
--- Toolbox) are absent and simply skipped.
+-- section's Skill= value. Containers with no trophy (Spell Research Kit, Toolbox) are absent
+-- and simply skipped.
 -- `better` is an OPTIONAL higher tier, best-first: if you own one (bags or bank) it's used instead
 -- of `trophy`. The base `trophy` stays the fallback and the thing we hard-stop on, so a character
 -- without the new tier behaves exactly as before. Adding a tier is one line here.
@@ -10456,6 +10456,11 @@ state.TROPHY_BY_CONTAINER = {
     ['Brew Barrel']          = { skill = 'Brewing',       trophy = "Brewmaster's Mug" },
     ['Brewing Barrel']       = { skill = 'Brewing',       trophy = "Brewmaster's Mug" },
     ['Mortar and Pestle']    = { skill = 'Make Poison',   trophy = 'Peerless Pestle' },
+    ['Medicine Bag']         = { skill = 'Alchemy',      trophy = 'Umbracite Swarm Orb',
+                                 better = { 'Mundunugu Medicine Stick' } },
+    ['Toolbox']              = { skill = 'Tinkering',    trophy = 'Hovering Contraption' },
+    ['Deluxe Toolbox']       = { skill = 'Tinkering',    trophy = 'Hovering Contraption' },
+    ['Collapsible Toolbox']  = { skill = 'Tinkering',    trophy = 'Hovering Contraption' },
 }
 
 -- The trophy to actually use for a container: the first `better` tier you OWN (bags or bank),
@@ -10531,7 +10536,7 @@ state.ensure_trophy = function(containerStr)
     local first = trim(split_commas(containerStr or '')[1] or '')
     if first == '' then return true end
     local map = state.TROPHY_BY_CONTAINER[first]
-    if not map then return true end   -- no trophy for this container (Alchemy/Research/Tinkering)
+    if not map then return true end   -- no trophy for this container (Research uses a quill)
 
     -- Gate on the live skill, read via the [Skill:x] section's EQ skill name.
     local sec = (state.iniSections or {})['Skill:' .. map.skill]

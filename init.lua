@@ -3,6 +3,11 @@
 -- Bind: /tsui show|hide|toggle|stop
 
 local mq = require('mq')
+
+-- Sampled together at load so elapsed milliseconds can be turned back into a wall time.
+-- Globals, not locals: this chunk is already at Lua's 200-local ceiling.
+LOG_T0_WALL = os.time()
+LOG_T0_MS   = mq.gettime()
 local ImGui = require('ImGui')
 
 local INI_NAME = 'tradeskills.ini'
@@ -208,7 +213,7 @@ local UI = {
 
 local state = {
     VERSION = '1.01',                              -- release version, shown in the title bar
-    BUILD_TAG = 'trophies-alchemy-tinkering-2026-07-23',            -- release marker (log header + Settings = stale-copy check)
+    BUILD_TAG = 'lc-anyclassresearch-2026-07-31',            -- release marker (log header + Settings = stale-copy check)
     running = true,
     windowOpen = true,
     wasOpen = true,
@@ -322,6 +327,16 @@ end
 -- knobs itself (keeps the render function's upvalue count down).
 state.speedLevels = {
     combinePace   = { fast = 375,  medium = 550,  slow = 750,  slower = 1000, slowest = 1500 },   -- pause after every combine
+    -- BACK TO THE ORIGINAL VALUES, 2026-07-27, deliberately.
+    -- Note these do NOT mean what they say: mq.delay rounds up to a ~50ms tick, so every value here
+    -- costs roughly double - measured as "pace asked 50ms got 100ms" on every single placement. They
+    -- were briefly halved to make the labels honest, and that did save ~270ms per placement.
+    -- But halving was also the ONE change that could plausibly cause harm rather than just cost time,
+    -- and these doubled values are what the original data-backed sweep actually tested: 108 combines
+    -- at "50" (i.e. 100ms real) with zero desyncs. The much larger win came from elsewhere - guarding
+    -- the wdbg lines that were running a 120-read bag scan each, which took a placement from ~770ms to
+    -- ~215ms and carries no risk at all. Given that, the pace saving is not worth an unproven desync
+    -- risk. If you ever want it back, halve these and watch the desync counter in the run summary.
     placePace     = { blazing = 50, fast = 75, medium = 150, slow = 300 },   -- pause between slot placements; the ONE speed players tune. Data-backed sweep on Misty Thicket Picnic (the 8-placement product-on-cursor stress case): 100ms held ~400 combines and 50ms held 108, both with 0 real desyncs, so this ladder sits well inside proven-safe. Blazing (50) is send-it; Fast (75) is the expected default; Medium (150) comfortable; Slow (300) the old proven floor kept as a safety net for worse connections.
     combineSettle = { fast = 550,  medium = 800,  slow = 1100, slower = 1500, slowest = 2000 },   -- pause after staging, before /combine
     autoinvPace   = { fast = 750,  medium = 1000, slow = 1500, slower = 2000, slowest = 3000 },   -- pause between /autoinventory pulls
@@ -435,15 +450,21 @@ do
         for i = first, #sessions do keep[#keep + 1] = sessions[i] end
         prior = table.concat(keep)
     end
+    -- Drop any shared append handle before truncating. log_to_file keeps LOG_FH open across calls, and
+    -- rewriting the file underneath it would leave that handle writing into a file that no longer has
+    -- the length it thinks it does. Closing here means the next log line reopens cleanly.
+    if LOG_FH then pcall(function() LOG_FH:close() end); LOG_FH = nil end
     local fh = io.open(LOG_FILE_PATH, 'w')   -- rewrite: kept prior sessions + this fresh one
     if fh then
         if prior ~= '' then fh:write(prior) end
+
         fh:write(string.format('=== Lazcraft log - started %s [build %s] ===\n',
             os.date('%Y-%m-%d %H:%M:%S'), state.BUILD_TAG or '?'))
         fh:close()
         printf('\ag[Tradeskill]\ax logging to %s (keeping last %d runs) [build %s]', LOG_FILE_PATH, KEEP_SESSIONS, state.BUILD_TAG or '?')
     else
         LOG_FILE_PATH = nil   -- couldn't open the file; disable file logging quietly
+        if LOG_FH then pcall(function() LOG_FH:close() end); LOG_FH = nil end
     end
 end
 
@@ -698,10 +719,28 @@ end
 
 local function log_to_file(line)
     if not LOG_FILE_PATH then return end
-    local fh = io.open(LOG_FILE_PATH, 'a')
-    if not fh then return end
-    fh:write(string.format('[%s] %s\n', os.date('%H:%M:%S'), line))
-    fh:close()
+    -- KEEP THE HANDLE OPEN. This used to open, write and close on every single line. That was
+    -- tolerable at a few lines a minute; with per-placement timing it is three file opens per item
+    -- placed, and it started showing up in the very measurements it was recording. Open once, flush
+    -- per line so nothing is lost on a crash, and close on exit.
+    if not LOG_FH then
+        LOG_FH = io.open(LOG_FILE_PATH, 'a')
+        if not LOG_FH then return end
+    end
+    local fh = LOG_FH
+    -- MILLISECONDS, anchored to the wall clock. At one-second resolution a 200ms ordering problem and
+    -- a two-second stall look identical in the file, and every open sequencing bug here - trophies
+    -- firing before the bank bags open, a nav call that reports false - is exactly that kind of
+    -- question. AdventureTime went through this: the first attempt printed mq.gettime() % 1000 beside
+    -- os.date's seconds, but gettime is a monotonic counter with no relation to the second boundary,
+    -- so the fraction wrapped independently and timestamps ran BACKWARDS inside a second. Both clocks
+    -- are sampled once at load and the whole stamp derives from elapsed gettime, so the seconds and
+    -- the milliseconds cannot disagree.
+    local ms = mq.gettime() - LOG_T0_MS
+    fh:write(string.format('[%s.%03d] %s\n',
+             os.date('%H:%M:%S', LOG_T0_WALL + math.floor(ms / 1000)), ms % 1000, line))
+    fh:flush()   -- NOT close: the handle is shared and reused. Closing it left LOG_FH pointing at a
+                 -- dead handle, so the very next log line failed on a closed file.
 end
 
 -- File-only desync instrumentation. Writes straight to the log (no game-chat spam),
@@ -713,7 +752,20 @@ function state.dlog(msg, ...)
     log_to_file('DSDBG ' .. msg)
 end
 
-local function printf_log(msg, ...)
+-- GLOBAL, deliberately. It was local, and line 553 - the oversized-settings warning - calls it from a
+-- function defined ABOVE this point, so that call compiled to a global lookup and resolved to nil.
+-- It would have crashed the moment a bloated settings file was found, which is exactly when you want
+-- the warning. Making it global fixes that call and any other early one, and frees a local slot in a
+-- chunk that is already at Lua's 200-local ceiling.
+-- PHASE LOG. Every line already carries milliseconds; these mark the boundaries between stages so a
+-- run can be reconstructed afterwards instead of inferred. Deliberately few and deliberately at the
+-- places the open bugs live: the bank trip and the trophy pre-pass. Cheap enough to leave in.
+function tsphase(fmt, ...)
+    local ok, line = pcall(string.format, fmt, ...)
+    printf_log('[phase] %s', ok and line or tostring(fmt))
+end
+
+function printf_log(msg, ...)
     if select('#', ...) > 0 then msg = string.format(msg, ...) end
     printf('\ag[Tradeskill]\ax %s', msg)        -- chat: any \a color codes embedded in msg render here
     local plain = (msg:gsub('\a%-?.', ''))      -- strip color codes for the file log + UI (no bell-char litter)
@@ -825,50 +877,135 @@ state.peer_item_counts = function(peers, items)
     state.availReplies = {}
     state.availHolders = {}
     if not peers or #peers == 0 or not items or #items == 0 then return {} end
-    -- Fire ONE query per peer per pass, never FindItemCount and FindItemBankCount to the same peer at
-    -- once: on Laz's DanNet two concurrent queries to one peer collide (the second .Q read returns the
-    -- FIRST query's result), so a BANK-only item read back its bags count (0) and got skipped -> bought.
-    -- So for each item we sweep bags across all peers, read them, THEN sweep bank across all peers. This
-    -- is the same one-query-per-peer shape as query_peer_zones, which never misbehaved.
-    local function sweep(query)
+
+    -- PIPELINED, one query outstanding per peer. The old shape swept one query type across all peers,
+    -- waited for the lot, then did the next - serial across items, so 16 items x 2 reads was 32 waits
+    -- of up to 2s each. It also had no retry: a query dropped under load read back as a silent 0, and a
+    -- silent 0 on a bank read is exactly how an item gets bought that a mule already had.
+    -- This is AdventureTime's counts pass, which has been answering 80/80 with 0 re-fires: each peer
+    -- keeps its OWN cursor through the query list, so no peer ever has two queries in flight (the
+    -- collision the old comment describes is still avoided), but the peers advance independently.
+    -- Lost queries are re-fired, persistently-failing peers are dropped, and the fire gap widens under
+    -- congestion - retrying INTO the congestion that caused a miss is what turns a 2s job into a 22s one.
+    local qs = {}                                   -- { {item=, bank=false|true, q=}, ... }
+    for _, it in ipairs(items) do
+        qs[#qs + 1] = { item = it, bank = false, q = ('FindItemCount[=%s]'):format(it) }
+        qs[#qs + 1] = { item = it, bank = true,  q = ('FindItemBankCount[=%s]'):format(it) }
+    end
+
+    local function fire(pr, q) pcall(function() mq.cmdf('/squelch /dquery %s -q "%s"', pr, q) end) end
+    local function readQ(pr, q)
+        local got
+        pcall(function()
+            local v = mq.TLO.DanNet(pr).Q(q)()
+            local raw = (v == nil) and '' or tostring(v)
+            if raw ~= '' and raw ~= 'NULL' then got = raw end
+        end)
+        return got
+    end
+
+    local PER_Q, MAX_TRIES, MAX_DEAD = 300, 3, 4
+    -- SPACING, not a time budget. AdventureTime derives its gap from a 5s budget over 80 queries, which
+    -- lands on ~62ms - and 62ms is what actually works on this DanNet. Copying the 5000 to a pass with
+    -- TWICE the queries (bags AND bank per item) would halve the spacing to ~31ms, which is back at the
+    -- 25ms AT explicitly calls "far too tight: bunched fires are exactly what DanNet drops". The budget
+    -- was the knob; the spacing was the reason. So set the spacing directly and let the pass take as
+    -- long as it takes - a clean 10s pass beats a 5s one that spends the difference on re-fires.
+    local FIRE_GAP  = 62
+    local BUDGET_MS = FIRE_GAP * math.max(1, #peers * #qs)   -- derived, for the deadline below
+    local gap, GAP_MAX, goodRun, refires = FIRE_GAP, 250, 0, 0
+    local lastFire, t0 = 0, mq.gettime()
+
+    local totals = {}                               -- peer -> item -> count
+    for _, pr in ipairs(peers) do totals[pr] = {} end
+    local idx, firedAt, tries, dead, fired, unresolved = {}, {}, {}, {}, {}, {}
+    for _, pr in ipairs(peers) do idx[pr] = 1; tries[pr] = 0; dead[pr] = 0; fired[pr] = false end
+
+    tsphase('peer counts: %d peers x %d queries, %dms spacing (~%.1fs if clean)',
+            #peers, #qs, FIRE_GAP, BUDGET_MS / 1000)
+    local function pending() for _, pr in ipairs(peers) do if idx[pr] then return true end end return false end
+    local hardDl = mq.gettime() + math.max(20000, BUDGET_MS * 4)
+
+    while pending() and mq.gettime() < hardDl do
+        mq.delay(10)
         for _, pr in ipairs(peers) do
-            pcall(function() mq.cmdf('/dquery %s -q "%s"', pr, query) end)
-        end
-        local res = {}
-        local deadline = mq.gettime() + 2000
-        while mq.gettime() < deadline do
-            mq.delay(40)
-            local pending = false
-            for _, pr in ipairs(peers) do
-                if res[pr] == nil then
-                    local got
-                    pcall(function()
-                        local v = mq.TLO.DanNet(pr).Q(query)()
-                        if v ~= nil and tostring(v) ~= '' and tostring(v) ~= 'NULL' then got = tonumber(tostring(v)) or 0 end
-                    end)
-                    if got ~= nil then res[pr] = got else pending = true end
+            local i = idx[pr]
+            if i then
+                if not fired[pr] then
+                    if mq.gettime() - lastFire >= gap then
+                        fire(pr, qs[i].q); firedAt[pr] = mq.gettime(); lastFire = mq.gettime(); fired[pr] = true
+                    end
+                else
+                    local v = readQ(pr, qs[i].q)
+                    if v then
+                        local n = tonumber(v) or 0
+                        totals[pr][qs[i].item] = (totals[pr][qs[i].item] or 0) + n
+                        dead[pr] = 0; tries[pr] = 0
+                        goodRun = goodRun + 1
+                        if goodRun >= 8 and gap > FIRE_GAP then gap = math.max(FIRE_GAP, gap - 10); goodRun = 0 end
+                        idx[pr] = i + 1; fired[pr] = false
+                        if idx[pr] > #qs then idx[pr] = nil end
+                    elseif (mq.gettime() - (firedAt[pr] or 0)) > PER_Q then
+                        tries[pr] = tries[pr] + 1
+                        if tries[pr] < MAX_TRIES then
+                            refires = refires + 1
+                            fired[pr] = false                       -- lost: re-fire the same query
+                        else
+                            unresolved[#unresolved + 1] = { pr, i }  -- park it; do NOT call it 0
+                            gap = math.min(GAP_MAX, gap + 25); goodRun = 0
+                            dead[pr] = dead[pr] + 1; tries[pr] = 0
+                            if dead[pr] >= MAX_DEAD then
+                                for j = i, #qs do unresolved[#unresolved + 1] = { pr, j } end
+                                idx[pr] = nil
+                                tsphase('peer counts: %s dark, dropped at query %d', pr, i)
+                            else
+                                idx[pr] = i + 1; fired[pr] = false
+                                if idx[pr] > #qs then idx[pr] = nil end
+                            end
+                        end
+                    end
                 end
             end
-            if not pending then break end
         end
-        return res
     end
-    for _, item in ipairs(items) do
-        local inv  = sweep(('FindItemCount[=%s]'):format(item))
-        local bank = sweep(('FindItemBankCount[=%s]'):format(item))
-        for _, pr in ipairs(peers) do
-            local total = (inv[pr] or 0) + (bank[pr] or 0)
-            if total > 0 then
-                state.availReplies[item] = (state.availReplies[item] or 0) + total
-                state.availHolders[item] = state.availHolders[item] or {}
-                state.availHolders[item][pr] = (state.availHolders[item][pr] or 0) + total
+
+    -- QUIET SWEEP. Everything above ran while every other peer was also being queried. That contention
+    -- is over now, so parked queries get one patient retry each with nothing to contend with. Only what
+    -- fails HERE is genuinely unknown - and unknown is still not the same as zero.
+    if #unresolved > 0 then
+        tsphase('peer counts: sweeping %d unanswered quer(ies) with the network quiet', #unresolved)
+        for _, u in ipairs(unresolved) do
+            local pr, i = u[1], u[2]
+            -- Always retry a parked query. Not "if the total is nil" - totals accumulate bags AND bank,
+            -- so an item whose bags read succeeded already has a non-nil total while its bank read is
+            -- still missing. Checking for nil would skip exactly the reads worth retrying.
+            fire(pr, qs[i].q)
+            local dl = mq.gettime() + 1200
+            while mq.gettime() < dl do
+                mq.delay(40)
+                local v = readQ(pr, qs[i].q)
+                if v then totals[pr][qs[i].item] = (totals[pr][qs[i].item] or 0) + (tonumber(v) or 0); break end
             end
         end
     end
+
+    for _, pr in ipairs(peers) do
+        for _, it in ipairs(items) do
+            local n = totals[pr][it] or 0
+            if n > 0 then
+                state.availReplies[it] = (state.availReplies[it] or 0) + n
+                state.availHolders[it] = state.availHolders[it] or {}
+                state.availHolders[it][pr] = (state.availHolders[it][pr] or 0) + n
+            end
+        end
+    end
+    tsphase('peer counts: done in %dms, %d re-fire(s), %d parked', mq.gettime() - t0, refires, #unresolved)
+
     local avail = {}
     for _, item in ipairs(items) do
         if (state.availReplies[item] or 0) > 0 then avail[item] = state.availReplies[item] end
     end
+
     return avail
 end
 
@@ -2598,9 +2735,15 @@ local function delay(ms, cond)
             return (state.stopRequested or cond()) and true or false
         end)
     else
-        local deadline = mq.gettime() + ms
-        while mq.gettime() < deadline and not state.stopRequested do
-            mq.delay(math.min(100, math.max(1, deadline - mq.gettime())))
+        -- ONE sleep, not a spin. This used to loop until a deadline, calling mq.delay for whatever was
+        -- left - but mq.delay returns a hair early, so the loop almost always ran a second time asking
+        -- for ~1ms, and mq.delay cannot do 1ms: it costs a whole tick. Measured on a world-container
+        -- combine: "pace asked 50ms got 99ms", every single placement, i.e. exactly double.
+        -- That doubled the entire placement pace ladder - Blazing 50 behaved like 100 - and since the
+        -- drop itself settles in 0ms, the pace WAS the whole cost of a placement.
+        -- Sleep once for the time asked, pump events once, done. The stop check below still runs.
+        if ms > 0 and not state.stopRequested then
+            mq.delay(ms)
             mq.doevents()
         end
     end
@@ -2648,6 +2791,57 @@ local function ts_set_response(kind)
         }
     end
 end
+-- LISTENER LIVENESS. Every site that needed a listener used to fire '/lua run TradeskillListener'
+-- unconditionally and then sleep two or three seconds, whether or not one was already running. That
+-- is a fixed wait standing in for knowing: it costs the full delay when the listener was already up,
+-- and it proceeds regardless when the listener is slow, so the work is sent into nothing.
+-- Ask instead. A listener that answers is ready NOW - no wait at all. Only silence means start one,
+-- and then we wait for the answer rather than for a clock.
+-- GLOBAL, not local: this file is already at Lua's 200-local ceiling for a main chunk, and one more
+-- local will not compile. Same reason several AdventureTime state tables are globals.
+listenerPong = {}                -- lowercase name -> when it last answered
+mq.bind('/ts_pong', function(who)
+    if who and who ~= '' then listenerPong[who:lower()] = mq.gettime() end
+end)
+
+-- Returns true when a listener on `char` is up and has said so. Cheap when it already is.
+function state.ensure_listener(char)
+    if not char or char == '' then return false end
+    local key = char:lower()
+
+    -- Already answered in the last few seconds? Nothing to do; do not even ask again.
+    if (mq.gettime() - (listenerPong[key] or 0)) < 5000 then return true end
+
+    -- Ask, and give the round trip a moment. This is the common case and it costs ~200ms, not 2000.
+    listenerPong[key] = nil
+    state.peer_cmdf(char, '/ts_ping %s', mq.TLO.Me.Name())
+    local deadline = mq.gettime() + 600
+    while mq.gettime() < deadline do
+        mq.delay(50); mq.doevents()
+        if listenerPong[key] then return true end
+    end
+
+    -- No answer: it is dead, crashed, or timed out. Start one and wait for it to speak, up to 8s.
+    -- Polling for the answer rather than sleeping a fixed 2s means a slow start still works and a
+    -- fast one is not punished.
+    printf_log('[listener] %s did not answer - starting one', char)
+    state.peer_cmdf(char, '/lua run TradeskillListener')
+    deadline = mq.gettime() + 8000
+    while mq.gettime() < deadline do
+        mq.delay(100); mq.doevents()
+        if listenerPong[key] then
+            printf_log('[listener] %s is up', char)
+            return true
+        end
+        -- re-ask periodically; the listener may have started after our first ping went out
+        if ((mq.gettime() - deadline) % 1000) < 100 then
+            state.peer_cmdf(char, '/ts_ping %s', mq.TLO.Me.Name())
+        end
+    end
+    printf_log('\\ar[listener] %s never came up - its work will fail\\ax', char)
+    return false
+end
+
 mq.bind('/ts_have', ts_set_response('have'))
 mq.bind('/ts_none', ts_set_response('none'))
 mq.bind('/ts_done', ts_set_response('done'))
@@ -2730,7 +2924,7 @@ state.query_peer_zones = function(peers)
     local out = {}
     -- fire all queries first so the round-trips run in parallel
     for _, p in ipairs(peers) do
-        pcall(function() mq.cmdf('/dquery %s -q Zone.ShortName', p) end)
+        pcall(function() mq.cmdf('/dquery %s -q "Zone.ShortName"', p) end)   -- quote like every other call site
     end
     -- then poll each peer's result slot until it lands (or we time out)
     local deadline = mq.gettime() + 2000
@@ -3162,8 +3356,7 @@ local function request_supply(itemName, needed, recipient)
         local encodedName = namecodec.encode(itemName)
 
         -- Start listener on mule
-        state.peer_cmdf(muleName, '/lua run TradeskillListener')
-        mq.delay(2000)  -- give it time to start
+        state.ensure_listener(muleName)
 
         -- Ask the mule to deliver one stack. It withdraws, navs, and trades on its
         -- own. Sent over /dex (silent peer network) with our name so the mule can
@@ -3279,8 +3472,7 @@ local function request_make(itemName, qty)
     -- would kill the first one mid-cast; instead the running listener queues each /ts_make in turn.
     state.makeListenersStarted = state.makeListenersStarted or {}
     if not state.makeListenersStarted[producer] then
-        state.peer_cmdf(producer, '/lua run TradeskillListener')
-        mq.delay(2000)
+        state.ensure_listener(producer)
         state.makeListenersStarted[producer] = true
     end
     makeResponse = { type = nil }
@@ -3385,8 +3577,7 @@ state.dispatch_makes = function(basket)
     -- Send one make share to a caster (starting its listener once).
     local function fire(caster, item, qty)
         if not state.makeListenersStarted[caster] then
-            state.peer_cmdf(caster, '/lua run TradeskillListener')
-            mq.delay(2000)
+            state.ensure_listener(caster)
             state.makeListenersStarted[caster] = true
         end
         printf_log('Asking %s to make %d %s...', caster, qty, item)
@@ -3491,8 +3682,7 @@ local function request_all(itemName)
         end
         if reachable then
             printf_log('Requesting ALL %s from %s (bank sweep)...', itemName, muleName)
-            state.peer_cmdf(muleName, '/lua run TradeskillListener')
-            mq.delay(2000)
+            state.ensure_listener(muleName)
             supplyResponse = { type = nil }
             state.peer_cmdf(muleName, '/ts_need_all %s %s', myName, encodedName)
 
@@ -3618,8 +3808,7 @@ state.request_supply_grouped = function(items, targetChar)
             local shortItems = {}
             for _, it in ipairs(items) do if short(it) then shortItems[#shortItems + 1] = it end end
             printf_log('Asking %s for %d still-needed item(s) in one batch...', charName, #shortItems)
-            state.peer_cmdf(charName, '/lua run TradeskillListener')
-            mq.delay(2000)
+            state.ensure_listener(charName)
 
             -- Build the batch on the mule (one /ts_qadd per item), snapshotting our counts
             -- so we can measure what actually arrives.
@@ -4051,8 +4240,7 @@ state.deliver_to_peer = function(peerName, itemName, qty)
     if qty <= 0 or item_count(itemName) <= 0 then
         printf_log('Nothing to hand %s: no %s on hand.', peerName, itemName); return 0
     end
-    state.peer_cmdf(peerName, '/lua run TradeskillListener')   -- so it can click its side of the trade
-    mq.delay(1500)
+    state.ensure_listener(peerName)   -- so it can click its side of the trade
 
     local pid = mq.TLO.Spawn(string.format('pc "%s"', peerName)).ID() or 0
     if pid == 0 then printf_log('Cannot find %s to deliver %s.', peerName, itemName); return 0 end
@@ -5020,9 +5208,20 @@ end
 -- No drain_cursor() here (it bails/cascades on desync); we autoinventory directly and re-check, so a
 -- leftover product from a prior combine can never end up dropped into a slot.
 local function world_place(name, slot)
-    wdbg('place %s -> enviro%d (bags=%d)', name, slot, item_count(name))
+    -- WHOLE-CALL TIMER. Pace and pickup are both measured and both small (51ms x2, and 0ms), yet
+    -- placements sit ~500ms apart - so ~400ms is somewhere neither number covers. Rather than guess a
+    -- third time, time the entry-to-exit and the individual TLO-heavy steps, and let the log say.
+    local _w0 = mq.gettime()
+    local _tSetup, _tFind, _tVerify, _tEvents, _tSlotName = 0, 0, 0, 0, 0
+    -- GUARDED. wdbg() returns immediately when WDBG is off - but Lua evaluates the ARGUMENTS first,
+    -- and item_count() walks 12 bags and every slot in each (~120 TLO reads). So this line paid for a
+    -- full bag scan to build a string that was then discarded. Measured: the two blocks containing an
+    -- item_count call were 84ms and 100ms of a 414ms placement; nothing else in them cost anything.
+    if WDBG then wdbg('place %s -> enviro%d (bags=%d)', name, slot, item_count(name)) end
     for attempt = 1, 5 do
+        local _s0 = mq.gettime()
         mq.doevents()
+        _tEvents = _tEvents + (mq.gettime() - _s0)
         if stationInUse then return false end
         if item_count(name) <= 0 then return false end
 
@@ -5041,6 +5240,8 @@ local function world_place(name, slot)
         end
 
         -- 2. Pick up ONE. Ctrl grabs a single from a stack; plain for a single item. Address by bag slot.
+        _tSetup = _tSetup + (mq.gettime() - _s0)
+        local _f0 = mq.gettime()
         do
             local fi = mq.TLO.FindItem('=' .. name)
             local iSlot  = fi.ItemSlot() or 0
@@ -5054,8 +5255,15 @@ local function world_place(name, slot)
                 mq.cmdf('/nomodkey /ctrlkey /itemnotify "%s" leftmouseup', name)
             end
         end
+        _tFind = _tFind + (mq.gettime() - _f0)
+        local _u0 = mq.gettime()
         mq.delay(1000, function() return cursor_id() > 0 or mq.TLO.Window('QuantityWnd').Open() end)
-        if mq.TLO.Window('QuantityWnd').Open() then accept_qty_window(1) end
+        local _pickMs = mq.gettime() - _u0
+        local _qtyMs = 0
+        if mq.TLO.Window('QuantityWnd').Open() then
+            local _q0 = mq.gettime(); accept_qty_window(1); _qtyMs = mq.gettime() - _q0
+        end
+        tsphase('world_place %s slot%d: pickup %dms, qty window %dms', name, slot, _pickMs, _qtyMs)
 
         -- 3. Verify the cursor holds exactly 1 of the RIGHT item. Anything else -> put it back, retry.
         if cursor_id() == 0 then
@@ -5072,17 +5280,35 @@ local function world_place(name, slot)
         end
 
         -- 4. Drop into the slot.
+        -- TIMED. The pace knob (Blazing 50 / Fast 75 / Medium 150 / Slow 300) is applied here, but
+        -- delay() without a condition spins on mq.delay + mq.doevents, so the real cost is at least a
+        -- frame plus whatever events are queued - which may swallow the difference between 50 and 75
+        -- entirely. Measure it rather than assume: if 'asked 50 got 90' shows up, the knob is being
+        -- overridden by the frame loop and the ladder needs rethinking, not the setting changing.
+        local _p0 = mq.gettime()
         delay(PLACE_PACE_MS)
+        local _paceActual = mq.gettime() - _p0
+        local _d0 = mq.gettime()
         mq.cmdf('/nomodkey /itemnotify enviro%d leftmouseup', slot)
         mq.delay(800, function() return cursor_id() == 0 end)
+        tsphase('world_place %s slot%d: pace asked %dms got %dms, drop settled in %dms',
+                name, slot, PLACE_PACE_MS, _paceActual, mq.gettime() - _d0)
 
         -- 5. Verify the slot holds our item and the cursor is empty. If wrong, clean up and retry.
+        local _v0 = mq.gettime()
         if cursor_id() == 0 then
+            local _n0 = mq.gettime()
             local placed = world_slot_name(slot)
+            _tSlotName = _tSlotName + (mq.gettime() - _n0)
             if placed and placed:upper() == name:upper() then
-                wdbg('placed %s -> enviro%d: slot holds %s x%d (bags left=%d)',
-                    name, slot, placed, mq.TLO.InvSlot('enviro' .. slot).Item.Stack() or 1, item_count(name))
+                if WDBG then
+                    wdbg('placed %s -> enviro%d: slot holds %s x%d (bags left=%d)',
+                        name, slot, placed, mq.TLO.InvSlot('enviro' .. slot).Item.Stack() or 1, item_count(name))
+                end
+                _tVerify = _tVerify + (mq.gettime() - _v0)
                 delay(PLACE_PACE_MS)
+                tsphase('world_place %s slot%d TOTAL %dms (doevents %d, setup-rest %d, find+grab %d, verify %d of which slotname %d)',
+                        name, slot, mq.gettime() - _w0, _tEvents, _tSetup - _tEvents, _tFind, _tVerify, _tSlotName)
                 return true
             end
             wdbg('after drop, enviro%d holds %s (wanted %s) - retry %d', slot, tostring(placed), name, attempt)
@@ -7482,7 +7708,7 @@ state.source_gems_for_plan = function(plan)
     state.makeListenersStarted = state.makeListenersStarted or {}
     for caster in pairs(plan) do
         if not state.makeListenersStarted[caster] then
-            state.peer_cmdf(caster, '/lua run TradeskillListener'); mq.delay(1500)
+            state.ensure_listener(caster)
             state.makeListenersStarted[caster] = true
         end
     end
@@ -8342,10 +8568,26 @@ ensure_kit_in_pack = function(containerName, kitPack)
 
     local kitName, kitSlot, kitSlot2 = find_kit_in_inventory()
 
-    -- If not found anywhere, buy one
+    -- If not found anywhere, try the BANK first, then buy.
+    if not kitName then
+        -- The bank check has to come BEFORE the quest bail: a quest kit can't be bought, but it can
+        -- absolutely be sitting in our own bank from a previous run. Bailing first meant a banked
+        -- Concordance read as "you don't have one".
+        -- NB: a quest kit has an EMPTY buyOrder (never bought), and an empty table is truthy in Lua -
+        -- so fall through to variants on length, not on nil. And read via state.bank_count, which
+        -- handles the closed-bank read; the raw TLO returns 0 until the bank bags are actually open.
+        local kitList = (cfg.buyOrder and #cfg.buyOrder > 0) and cfg.buyOrder or cfg.variants
+        for _, v in ipairs(kitList or {}) do
+            if state.bank_count(v) > 0 and state.withdraw_count(v, 1) > 0 then
+                kitName = v
+                printf_log('Pulled %s from the bank.', kitName)
+                break
+            end
+        end
+    end
     if not kitName then
         if cfg.quest then
-            printf_log('\ar%s is a quest item and you do not have one - cannot craft this. (The suite does not run the quest.)\ax', containerName)
+            printf_log('\ar%s is a quest item, and none is in your inventory or bank - cannot craft this. (The suite does not run the quest.)\ax', containerName)
             return false
         end
         printf_log('No %s found - buying one...', containerName)
@@ -9762,25 +10004,19 @@ end
 -- (recipes are keyed [Recipe:<name>##<class>], so rec.name alone won't find them).
 -- No crafting/vendor logic is copied from the old macro - only its recipe data.
 
-local RESEARCH_TOME_CLASSES = {
-    war = true, warrior = true, rog = true, rogue = true, mnk = true, monk = true,
-    rng = true, ranger = true, bst = true, beastlord = true, shd = true, shadowknight = true,
-    pal = true, paladin = true, brd = true, bard = true, ber = true, berserker = true,
-}
-
--- A research product is a tome/discipline unless its name is a caster Spell:/Song:.
+-- A research product is a tome/discipline unless its name is a caster Spell:/Song:. Kept purely for
+-- LABELLING - the list marks tomes with "(tome)" in purple - not for deciding what anyone may craft.
 local function is_research_tome(name)
     if not name then return false end
     return not (name:sub(1, 6) == 'Spell:' or name:sub(1, 5) == 'Song:')
 end
 
--- Only melee/hybrid characters can make tomes - checked against the live character.
-local function char_can_make_tomes()
-    local c = (mq.TLO.Me.Class.ShortName() or ''):lower()
-    if RESEARCH_TOME_CLASSES[c] then return true end
-    local n = (mq.TLO.Me.Class.Name() or ''):lower()
-    return RESEARCH_TOME_CLASSES[n] == true
-end
+-- THERE IS NO CLASS RESTRICTION ON RESEARCH. This used to hold a RESEARCH_TOME_CLASSES list of melee and
+-- hybrid classes and a char_can_make_tomes() check against the live character, so a caster saw "Spells
+-- only" and had the + button greyed out on every tome. That turned out to be wrong: any class can craft
+-- either kind. Research is a tradeskill, and the combine does not care who is standing at the kit - the
+-- resulting book is only USABLE by the class it belongs to, which is a separate matter from making it.
+-- Removed rather than always-true'd, so nothing is left implying a rule that does not exist.
 
 -- Move (or acquire) a research kit into the kit pack slot.
 local function run_research_kit(job)
@@ -10213,9 +10449,13 @@ state.bankTopUp = function(itemName, target)
 
     -- Open the bank.
     if not mq.TLO.Window('BigBankWnd').Open() then
+        local t0 = mq.gettime()
+        tsphase('bank window: clicking banker')
         mq.cmd('/click right target')
         mq.delay(1000, function() return mq.TLO.Window('BigBankWnd').Open() end)
         state.bank_bag_opened = {}   -- fresh open: reset the per-trip opened-bag set
+        tsphase('bank window: %s after %dms',
+                mq.TLO.Window('BigBankWnd').Open() and 'OPEN' or 'STILL SHUT', mq.gettime() - t0)
     end
     if not mq.TLO.Window('BigBankWnd').Open() then
         printf_log('Bank: could not open the bank window for %s.', itemName)
@@ -10532,6 +10772,10 @@ end
 state.TROPHY_THRESHOLD = 300
 state.runIsLeveling = false
 state.ensure_trophy = function(containerStr)
+    tsphase('ensure_trophy: start (container=%s, bank window %s, bankSeenThisRun=%s)',
+            tostring(containerStr),
+            mq.TLO.Window('BigBankWnd').Open() and 'OPEN' or 'shut',
+            tostring(state.bankSeenThisRun))
     if state.runIsLeveling then return true end   -- leveling run: never touch a trophy
     local first = trim(split_commas(containerStr or '')[1] or '')
     if first == '' then return true end
@@ -10709,6 +10953,12 @@ state.bank_count = function(name)
         result = (ok and type(n) == 'number') and n or 0
     end
     if not bankOpen then state._bankCache[name] = result end
+    -- A 0 read when the bank is SHUT and nothing was visible is the exact shape of the trophy pre-pass
+    -- bug: we asked before the bank could answer. Log those, and only those - a real 0 with the bank
+    -- open is just an empty bank and not worth a line.
+    if result == 0 and not bankOpen and not visible then
+        tsphase("bank_count('%s') = 0 with the bank SHUT and nothing visible - may be a premature read", name)
+    end
     return result
 end
 
@@ -11606,8 +11856,7 @@ local function run_request_queue(job)
                 -- Hand a stack to another character (e.g. Black Pearl to the cleric). Start its
                 -- listener so it accepts the incoming trade, then have a mule deliver TO it.
                 printf_log('[%d/%d] Deliver %s to %s', idx, #reqs, req.item, req.recipient)
-                state.peer_cmdf(req.recipient, '/lua run TradeskillListener')
-                mq.delay(2000)
+                state.ensure_listener(req.recipient)
                 request_supply(req.item, req.qty or 1000, req.recipient)
             else
                 local n = tonumber(req.qtyBuf or '')
@@ -14395,7 +14644,6 @@ local function render_window()
                             ImGui.EndCombo()
                         end
 
-                        local canTome = char_can_make_tomes()
                         local idx = (state.researchIndex or {})[state.rsClass] or {}
 
                         -- Which types does this class actually have? Offer a radio only for types that
@@ -14407,7 +14655,7 @@ local function render_window()
                             end
                             if classHasTomes and classHasSpells then break end
                         end
-                        local showTomes  = canTome and classHasTomes   -- character must also be able to make tomes
+                        local showTomes  = classHasTomes
                         local showSpells = classHasSpells
 
                         -- Keep the active filter valid for what's actually shown.
@@ -14428,10 +14676,6 @@ local function render_window()
                         elseif showSpells then
                             state.rsTypeFilter = 'spells'
                             ImGui.TextDisabled('Spells only')
-                            if classHasTomes and not canTome then
-                                ImGui.SameLine()
-                                ImGui.TextColored(0.9, 0.7, 0.3, 1.0, string.format("  %s can't make tomes.", mq.TLO.Me.Class.ShortName() or '?'))
-                            end
                         elseif showTomes then
                             state.rsTypeFilter = 'tomes'
                             ImGui.TextDisabled('Tomes only')
@@ -14485,9 +14729,7 @@ local function render_window()
                         -- Skips anything already queued so a repeat press doesn't pile on.
                         if themed_button(string.format('Queue All (%d)##ts_rs_queueall', #list), UI.green, 150, UI.btn_h, #list == 0) then
                             for _, e in ipairs(list) do
-                                if not (is_research_tome(e.name) and not canTome) then
-                                    state.rs_queue_add(e.name, e.level, q, state.rsClass, false)
-                                end
+                                state.rs_queue_add(e.name, e.level, q, state.rsClass, false)
                             end
                         end
 
@@ -14504,9 +14746,8 @@ local function render_window()
                                 ImGui.TextDisabled('  no matching spells/tomes for this class/level/type')
                             else
                                 for i, e in ipairs(list) do
-                                    local tome    = is_research_tome(e.name)
-                                    local blocked = tome and not canTome
-                                    if themed_button('+##ts_rs_one_' .. i, blocked and UI.steel or UI.blue, 26, UI.btn_h, blocked) then
+                                    local tome = is_research_tome(e.name)
+                                    if themed_button('+##ts_rs_one_' .. i, UI.blue, 26, UI.btn_h) then
                                         state.rs_queue_add(e.name, e.level, q, state.rsClass, true)
                                     end
                                     ImGui.SameLine()

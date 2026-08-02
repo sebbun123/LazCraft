@@ -1,8 +1,14 @@
 local mq = require('mq')
 
-local BUILD_TAG = 'tsl-dannet-first-2026-07-22'   -- bump on every change; prints in the log header
+local BUILD_TAG = 'tsl-tradeguard-2026-07-27'   -- bump on every change; prints in the log header
 
 local running = true
+-- Set while WE are filling a trade window. The main loop's incoming-trade handler accepts any open
+-- TradeWnd, and mq.delay inside our own fill yields - so the loop could fire mid-fill and confirm our
+-- half-loaded window before every item was in. The log showed exactly that: an "Incoming trade -
+-- clicking Trade to accept / Trade window closed" pair BEFORE the "Placed ..." line.
+-- AdventureTime guards the same handler with its `giving` flag; this is the same idea.
+local tradingNow = false
 -- Items queued by /ts_qadd, delivered as one batch on /ts_qrun (one bank trip, one trade window).
 local pendingBatch = {}
 -- Summon/produce jobs queued by /ts_make, drained one at a time by the main loop so a crafter can
@@ -105,13 +111,7 @@ local peerKind
 local function peer_cmdf(char, fmt, ...)
     local cmd = fmt:format(...)
     if not peerKind then
-        local dnet = mq.TLO.Plugin('MQ2DanNet')() ~= nil
-        if not dnet then pcall(function() mq.cmd('/plugin mq2dannet load') end); mq.delay(750); dnet = mq.TLO.Plugin('MQ2DanNet')() ~= nil end
-        if dnet then
-            peerKind = 'dannet'
-            pcall(function() mq.cmd('/squelch /dnet localecho off') end)
-            pcall(function() mq.cmd('/squelch /dnet commandecho off') end)
-        elseif mq.TLO.Plugin('mq2mono')() then peerKind = 'e3'
+        if mq.TLO.Plugin('mq2mono')() then peerKind = 'e3'
         elseif mq.TLO.Plugin('MQ2EQBC')() then peerKind = 'eqbc'
         else peerKind = 'dannet' end
         log('Peer network: %s', peerKind == 'e3' and 'E3 (/e3bct)' or peerKind == 'eqbc' and 'EQBC (/bct)' or 'DanNet (/dex)')
@@ -431,133 +431,160 @@ local function nav_to_char(name)
     return (mq.TLO.Spawn('pc "' .. name .. '"').Distance() or 999) < 15
 end
 
-local function trade_item(toChar, itemName, qty)
-    log('trade_item called: toChar=%s item=%s qty=%d', toChar, itemName, qty)
-    if not nav_to_char(toChar) then log('Could not reach %s.', toChar); return false end
+-- Pick up ONE slot's worth of `itemName` (up to `want`) and drop it into the trade window. Returns
+-- the stack size placed, or 0. This is lifted verbatim out of the old single-item trade_item - the
+-- gestures are unchanged and proven; only what loops around them is new.
+local function place_one_slot(itemName, want)
+    local bagNum, slotNum = find_item_slot(itemName)
+    if not bagNum then return 0 end
+    local slotStack = mq.TLO.Me.Inventory('pack' .. bagNum).Item(slotNum).Stack() or 1
+    want = math.min(want, slotStack)
+
+    if want >= slotStack then
+        mq.cmdf('/nomodkey /itemnotify in pack%d %d leftmouseup', bagNum, slotNum)
+        mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) > 0 or mq.TLO.Window('QuantityWnd').Open() end)
+        if mq.TLO.Window('QuantityWnd').Open() then
+            mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
+            mq.delay(500, function() return not mq.TLO.Window('QuantityWnd').Open() end)
+        end
+    else
+        local gotSplit = false
+        for _ = 1, 4 do
+            mq.cmdf('/itemnotify pack%d rightmouseup', bagNum)
+            mq.delay(450)
+            mq.cmdf('/itemnotify in pack%d %d leftmouseup', bagNum, slotNum)
+            mq.delay(800, function() return mq.TLO.Window('QuantityWnd').Open() or (mq.TLO.Cursor.ID() or 0) > 0 end)
+            if mq.TLO.Window('QuantityWnd').Open() then gotSplit = true; break end
+            if (mq.TLO.Cursor.ID() or 0) > 0 then
+                mq.cmd('/autoinventory'); mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+            end
+            mq.delay(150)
+        end
+        if gotSplit then
+            if not set_split_qty(want) then
+                log('trade: could not set partial %d of %s - stopping short (no over-deliver).', want, itemName)
+                mq.cmd('/keypress esc'); mq.delay(300, function() return not mq.TLO.Window('QuantityWnd').Open() end)
+                return 0
+            end
+            mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
+            mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) > 0 end)
+        else
+            log('trade: split would not open for %s - stopping short (never over-deliver).', itemName)
+            if (mq.TLO.Cursor.ID() or 0) > 0 then
+                mq.cmd('/autoinventory'); mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+            end
+            return 0
+        end
+    end
+
+    if (mq.TLO.Cursor.ID() or 0) == 0 then log('Failed to pick up %s.', itemName); return 0 end
+    local stackSize = mq.TLO.Cursor.Stack() or 1
+
+    mq.cmd('/notify TargetWindow Target_HP leftmouseup')     -- drop into the (open) trade window
+    mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+    if (mq.TLO.Cursor.ID() or 0) > 0 then
+        mq.cmd('/click left target')
+        mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+    end
+    if (mq.TLO.Cursor.ID() or 0) > 0 then
+        log('Could not place %s.', itemName)
+        mq.cmd('/autoinventory')
+        return 0
+    end
+    return stackSize
+end
+
+-- Trade a LIST of items in as few windows as possible. A trade window holds 8 slots, so we fill all
+-- eight ACROSS the items before confirming, and open another window if there is more to hand.
+--
+-- The old code traded one item type per window, on the belief that "packing several items into one
+-- trade window is unreliable - only the first item places cleanly". That was true of an earlier
+-- placement gesture. The gesture in place_one_slot above - drop on TargetWindow, fall back to
+-- /click left target - is the same one AdventureTime uses to hand three item types in a single
+-- window every night. So the workaround outlived the problem: four item types meant four separate
+-- nav-target-fill-confirm cycles when one would do.
+local function trade_batch(toChar, list)
+    if not list or #list == 0 then return false, {} end
+    tradingNow = true
+    if not nav_to_char(toChar) then log('Could not reach %s.', toChar); tradingNow = false; return false, {} end
     mq.cmdf('/target pc %s', toChar)
     mq.delay(500, function() return (mq.TLO.Target.Name() or ''):lower() == toChar:lower() end)
     if (mq.TLO.Target.Name() or ''):lower() ~= toChar:lower() then
-        log('Could not target %s.', toChar); return false
+        log('Could not target %s.', toChar); tradingNow = false; return false, {}
     end
     mq.cmd('/face fast')
     mq.delay(200)
 
-    -- E3 stays PAUSED for the whole trade. We used to /e3p off here so E3 would click the Trade
-    -- button to confirm - but a live E3 also grabs the cursor / re-targets / moves the toon DURING our
-    -- pickup, which broke the 2nd item in a batch (its split/grab failed while E3 was active). Instead
-    -- we keep E3 off and click TRDW_Trade_Button ourselves at the end. E3 never touches the cursor, so
-    -- every item's pickup is clean.
-    -- Pick up items and drop them ON the target; that's what opens/fills the trade window. We place
-    -- EXACTLY qty: whole stacks until the last piece, then a partial (split via SetText) for the
-    -- remainder. If a needed partial can't be set, we STOP rather than dump a whole stack (never
-    -- over-deliver) - so worst case we hand over slightly less, never more.
-    local placed = 0
-    local slotsUsed = 0
-    while slotsUsed < 8 and placed < qty do
-        local bagNum, slotNum = find_item_slot(itemName)
-        if not bagNum then break end
-        local slotStack = mq.TLO.Me.Inventory('pack' .. bagNum).Item(slotNum).Stack() or 1
-        local want = math.min(qty - placed, slotStack)
+    -- E3 stays PAUSED for the whole trade: a live E3 grabs the cursor mid-pickup and breaks the next
+    -- item. We click the Trade button ourselves at the end; the receiver's listener clicks theirs.
+    local placed, want = {}, {}
+    for _, e in ipairs(list) do want[e.item] = (want[e.item] or 0) + (e.qty or 0) end
 
-        if want >= slotStack then
-            -- take the whole slot stack (no split needed)
-            mq.cmdf('/nomodkey /itemnotify in pack%d %d leftmouseup', bagNum, slotNum)
-            mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) > 0 or mq.TLO.Window('QuantityWnd').Open() end)
-            if mq.TLO.Window('QuantityWnd').Open() then
-                mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
-                mq.delay(500, function() return not mq.TLO.Window('QuantityWnd').Open() end)
+    local guard = 0
+    while guard < 40 do
+        guard = guard + 1
+        local anyLeft = false
+        for it, q in pairs(want) do
+            if q > 0 and item_count(it) > 0 then anyLeft = true; break end
+        end
+        if not anyLeft then break end
+
+        local slots, movedThisTrade = 0, 0
+        for _, e in ipairs(list) do
+            local it = e.item
+            while (want[it] or 0) > 0 and slots < 8 and item_count(it) > 0 do
+                local moved = place_one_slot(it, want[it])
+                if moved <= 0 then break end
+                placed[it] = (placed[it] or 0) + moved
+                want[it]   = want[it] - moved
+                slots = slots + 1; movedThisTrade = movedThisTrade + moved
+            end
+            if slots >= 8 then break end
+        end
+
+        if movedThisTrade > 0 and mq.TLO.Window('TradeWnd').Open() then
+            local names = {}
+            for it, q in pairs(placed) do names[#names + 1] = string.format('%dx %s', q, it) end
+            log('Placed %s - clicking Trade to confirm...', table.concat(names, ', '))
+            mq.delay(300)
+            mq.cmd('/notify TradeWnd TRDW_Trade_Button leftmouseup')
+            mq.delay(8000, function() return not mq.TLO.Window('TradeWnd').Open() end)
+            if mq.TLO.Window('TradeWnd').Open() then
+                mq.cmd('/notify TradeWnd TRDW_Trade_Button leftmouseup')
+                mq.delay(4000, function() return not mq.TLO.Window('TradeWnd').Open() end)
+            end
+            if mq.TLO.Window('TradeWnd').Open() then
+                log('Trade window still open after confirm - cancelling.')
+                mq.cmd('/notify TradeWnd TRDW_Cancel_Button leftmouseup')
+                tradingNow = false
+                return false, placed
             end
         else
-            -- partial: pop the split dialog with the right-click TOGGLE then left-click the slot - the
-            -- SAME gesture the bank withdraw uses successfully. (Ctrl+click grabs a whole stack or a
-            -- single, it does NOT open a partial-count split - that was a wrong turn.) Retry with a
-            -- re-toggle each attempt; put back any whole grab between tries. Never place more than asked.
-            local gotSplit = false
-            for _ = 1, 4 do
-                mq.cmdf('/itemnotify pack%d rightmouseup', bagNum)
-                mq.delay(450)
-                mq.cmdf('/itemnotify in pack%d %d leftmouseup', bagNum, slotNum)
-                mq.delay(800, function() return mq.TLO.Window('QuantityWnd').Open() or (mq.TLO.Cursor.ID() or 0) > 0 end)
-                if mq.TLO.Window('QuantityWnd').Open() then gotSplit = true; break end
-                if (mq.TLO.Cursor.ID() or 0) > 0 then
-                    mq.cmd('/autoinventory'); mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-                end
-                mq.delay(150)
+            if mq.TLO.Window('TradeWnd').Open() then
+                mq.cmd('/notify TradeWnd TRDW_Cancel_Button leftmouseup')
             end
-            if gotSplit then
-                if not set_split_qty(want) then
-                    log('trade_item: could not set partial %d of %s - stopping short (no over-deliver).', want, itemName)
-                    mq.cmd('/keypress esc'); mq.delay(300, function() return not mq.TLO.Window('QuantityWnd').Open() end)
-                    break
-                end
-                mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
-                mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) > 0 end)
-            else
-                -- Split wouldn't open. With bags opened once up front this is now rare - and we do NOT
-                -- dump the whole stack (that was the "+456 for a 16 ask" over-deliver). Put back anything
-                -- on the cursor and stop short: worst case we deliver slightly LESS, never more.
-                log('trade_item: split would not open for %s - stopping short (never over-deliver).', itemName)
-                if (mq.TLO.Cursor.ID() or 0) > 0 then
-                    mq.cmd('/autoinventory'); mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-                end
-                break
-            end
+            break   -- nothing moved this pass; stop rather than spin
         end
-        if (mq.TLO.Cursor.ID() or 0) == 0 then
-            log('Failed to pick up %s.', itemName); break
-        end
-        local stackSize = mq.TLO.Cursor.Stack() or 1
-
-        -- drop it on the target (opens trade window / next slot)
-        mq.cmd('/notify TargetWindow Target_HP leftmouseup')
-        mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-        if (mq.TLO.Cursor.ID() or 0) > 0 then
-            mq.cmd('/click left target')
-            mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-        end
-        if (mq.TLO.Cursor.ID() or 0) > 0 then
-            log('Could not place %s on %s.', itemName, toChar)
-            mq.cmd('/autoinventory')
-            break
-        end
-
-        placed = placed + stackSize
-        slotsUsed = slotsUsed + 1
     end
 
-    if placed == 0 then
-        log('Placed nothing.')
-        if mq.TLO.Window('TradeWnd').Open() then
-            mq.cmd('/notify TradeWnd TRDW_Cancel_Button leftmouseup')
-        end
-        return false, 0
-    end
+    local total = 0
+    for _, q in pairs(placed) do total = total + q end
+    tradingNow = false
+    return total > 0, placed
+end
 
-    -- Confirm the trade OURSELVES by clicking the Trade button - E3 stays paused the whole time (a live
-    -- E3 grabs the cursor mid-pickup and breaks the next item). Click our side; the receiver's listener
-    -- clicks theirs. Wait for the window to close = both sides accepted.
-    log('Placed %d %s - clicking Trade to confirm...', placed, itemName)
-    mq.delay(300)
-    mq.cmd('/notify TradeWnd TRDW_Trade_Button leftmouseup')
-    mq.delay(8000, function() return not mq.TLO.Window('TradeWnd').Open() end)
-    if mq.TLO.Window('TradeWnd').Open() then
-        -- one more click in case the first landed before the receiver was ready, then give up cleanly
-        mq.cmd('/notify TradeWnd TRDW_Trade_Button leftmouseup')
-        mq.delay(4000, function() return not mq.TLO.Window('TradeWnd').Open() end)
-    end
-    if mq.TLO.Window('TradeWnd').Open() then
-        log('Trade window still open after confirm - cancelling.')
-        mq.cmd('/notify TradeWnd TRDW_Cancel_Button leftmouseup')
-        return false, 0
-    end
-    return true, placed
+-- Single-item trade, kept as a thin wrapper so existing callers are unchanged.
+local function trade_item(toChar, itemName, qty)
+    log('trade_item called: toChar=%s item=%s qty=%d', toChar, itemName, qty)
+    local ok, placed = trade_batch(toChar, { { item = itemName, qty = qty } })
+    return ok, placed[itemName] or 0
 end
 
 -- Deliver a whole batch of items in ONE bank trip + as few trades as possible.
 -- Phase 1: walk to the banker once and withdraw every item toward its target
 --          (stack mode -> top up to 1000; all mode -> pull the bank dry).
--- Phase 2: walk to the crafter and hand everything over one item per trade window
---          (single-item trades are reliable; multi-item packing was not). A /ts_have
+-- Phase 2: walk to the crafter and hand everything over in as few trade windows as possible
+--          (all items share a window, 8 slots at a time). A /ts_have
 --          ping before each trip keeps the crafter waiting. Returns total units delivered.
 local function open_all_bags()
     -- Open every inventory bag ONCE so a plain slot grab pops the split for a partial (AdventureTime's
@@ -626,23 +653,20 @@ local function deliver_batch(toChar, batch)
     -- trades are rock-solid. The expensive part - the bank trip - was already consolidated in Phase 1,
     -- so we still make just one bank run; we just hand items over one clean trade at a time.
     open_all_bags()   -- bags stay open for the whole trade so partial grabs pop the split
-    local delivered = {}
+    -- ONE trip, ONE window (or as few as 8 slots allow). This used to loop the batch and call
+    -- trade_item per item type, which navigated, targeted, filled and confirmed a separate window for
+    -- each - four item types meant four full cycles. trade_batch fills all eight slots across the items
+    -- before confirming, and opens another window only when there is genuinely more to hand.
+    local want = {}
     for _, b in ipairs(batch) do
         bump_alive()
         if find_item_slot(b.item) then
-            local want = cap[b.item]
-            if want == math.huge then want = item_count(b.item) end   -- 'all': give everything on hand
-            want = math.min(want, item_count(b.item))
-            if want > 0 then
-                peer_cmdf(toChar, '/ts_have %s 0', b.encoded)   -- keep the crafter waiting
-                local ok, placed = trade_item(toChar, b.item, want)
-                delivered[b.item] = (delivered[b.item] or 0) + (placed or 0)
-                -- 'all' with more than one trade window's worth: keep going until bags are clear.
-                while cap[b.item] == math.huge and find_item_slot(b.item) and (placed or 0) > 0 do
-                    peer_cmdf(toChar, '/ts_have %s 0', b.encoded)
-                    ok, placed = trade_item(toChar, b.item, item_count(b.item))
-                    delivered[b.item] = (delivered[b.item] or 0) + (placed or 0)
-                end
+            local q = cap[b.item]
+            if q == math.huge then q = item_count(b.item) end     -- 'all': give everything on hand
+            q = math.min(q, item_count(b.item))
+            if q > 0 then
+                want[#want + 1] = { item = b.item, qty = q }
+                peer_cmdf(toChar, '/ts_have %s 0', b.encoded)     -- keep the crafter waiting
             else
                 log('  %s: nothing tradeable in bags (bags %d, bank %d) - skipping.', b.item, item_count(b.item), bank_count(b.item))
             end
@@ -651,6 +675,25 @@ local function deliver_batch(toChar, batch)
             -- a bank item whose withdraw didn't land in bags (stuck on cursor, or bags full). Log it so a
             -- "check said yes, delivered 0" mismatch is visible instead of a silent skip.
             log('  %s: not found in a tradeable slot (bags %d, bank %d) - could not deliver.', b.item, item_count(b.item), bank_count(b.item))
+        end
+    end
+
+    local delivered = {}
+    if #want > 0 then
+        local _, placed = trade_batch(toChar, want)
+        delivered = placed or {}
+        -- 'all' means empty the bags, which can exceed one window's worth. trade_batch already loops
+        -- until nothing more moves, but an 'all' entry may have been capped by the count we read
+        -- before the first window - so top it up while there is still stock and room to give.
+        local more = {}
+        for _, b in ipairs(batch) do
+            if cap[b.item] == math.huge and item_count(b.item) > 0 then
+                more[#more + 1] = { item = b.item, qty = item_count(b.item) }
+            end
+        end
+        if #more > 0 then
+            local _, extra = trade_batch(toChar, more)
+            for it, q in pairs(extra or {}) do delivered[it] = (delivered[it] or 0) + q end
         end
     end
 
@@ -1175,6 +1218,15 @@ end)
 -- fires this to every group member in parallel on craft start, then only queues a (slow) delivery
 -- from members who actually have the item. FindItemBankCount reads the bank while it's CLOSED, which
 -- is what makes this cheap. Replies with /ts_avail <encoded> <count>.
+-- Am I here? The crafter asks before sending work, so it can tell "listener already running" from
+-- "listener died or timed out" WITHOUT a blind delay. Answering also bumps the idle deadline: being
+-- asked is a sign someone is about to use us, so we should not expire a second later.
+mq.bind('/ts_ping', function(sender)
+    if not sender or sender == '' then return end
+    bump_alive()
+    peer_cmdf(sender, '/ts_pong %s', mq.TLO.Me.Name())
+end)
+
 mq.bind('/ts_check', function(sender, encoded)
     if not sender or not encoded then return end
     bump_alive()
@@ -1438,7 +1490,7 @@ while running and mq.gettime() < aliveDeadline do
     -- clicking the Trade button, keeping E3 paused. (Was /e3p off to let E3 accept - but a live E3 can
     -- grab the cursor / drive the toon; clicking the button ourselves is deterministic and leaves E3
     -- untouched. This is the RECEIVER half; trade_item's confirm is the SENDER half.)
-    if mq.TLO.Window('TradeWnd').Open() then
+    if mq.TLO.Window('TradeWnd').Open() and not tradingNow then
         log('Incoming trade - clicking Trade to accept.')
         mq.delay(300)
         mq.cmd('/notify TradeWnd TRDW_Trade_Button leftmouseup')

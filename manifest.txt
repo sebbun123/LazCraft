@@ -1,0 +1,12 @@
+# LazCraft manifest - generated 2026-08-08 19:36:55
+# file = brought current on every install   delete = removed
+build lc-configver-2026-08-08
+config 20260808-836e08
+
+file init.lua 64b9f7ac75f77c1f95a70f03a5f91b4d31fc479964cda2b66011591a8668fb2d
+file tradeskills.ini 926582890e5bb3d356baee01f60e031dc5378d487f07cbeb94414dcffe65dc2c
+file merchants.ini 128b5fe5a9396cc533b46d55fa528a548b4dad2a70abc47756be0cae067fa8b4
+file research.ini c8c12f87fc6741b67f7d5c1f85973403764a45ca7c299cb4e3decc5a5c323ecf
+file stations.ini 2af2e447df9219a07507d1aba41f3c9924a55676f842e490b8e5d61e578aa918
+file fishing.ini 9e1a05874a310ffa12d74db5318213b45f3074eada997c9e8843a14322dbbf76
+delete TradeskillListener.lua

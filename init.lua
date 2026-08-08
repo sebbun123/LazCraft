@@ -1,8 +1,17 @@
 -- TradeskillSuite.lua - ImGui front-end + pure-Lua engine for tradeskill automation
--- Run: /lua run Lazcraft
+-- Run: /lua run Lazcraft                 the crafter: full UI and engine
+--      /lua run Lazcraft worker <crafter>  a mule: headless, answers supply requests, nothing else
 -- Bind: /tsui show|hide|toggle|stop
 
 local mq = require('mq')
+
+-- WORKER MODE. A mule exists to open its bank, hand things over, and shut up. It never crafts, never
+-- combines and never researches - so it should not spend seconds parsing recipe files it will not read,
+-- and it must not open an ImGui window on a character nobody is looking at.
+-- Globals rather than locals: this chunk is at Lua's 200-local ceiling and will not take more.
+LC_ARGS   = { ... }
+LC_WORKER = (tostring(LC_ARGS[1] or ''):lower() == 'worker')
+LC_CRAFTER = LC_WORKER and tostring(LC_ARGS[2] or '') or ''
 
 -- Sampled together at load so elapsed milliseconds can be turned back into a wall time.
 -- Globals, not locals: this chunk is already at Lua's 200-local ceiling.
@@ -213,7 +222,7 @@ local UI = {
 
 local state = {
     VERSION = '1.01',                              -- release version, shown in the title bar
-    BUILD_TAG = 'lc-anyclassresearch-2026-07-31',            -- release marker (log header + Settings = stale-copy check)
+    BUILD_TAG = 'lc-configver-2026-08-08',            -- release marker (log header + Settings = stale-copy check)
     running = true,
     windowOpen = true,
     wasOpen = true,
@@ -399,7 +408,17 @@ end
 -- /lua run, timestamped, flushed per line so the log survives a crash.
 -- ---------------------------------------------------------------------------
 local LOG_FILE_PATH
-do
+-- FILE LOGGING IS OFF BY DEFAULT. It was always-on, which meant every character wrote a rolling
+-- ten-session log nobody read, and the rotate-and-rewrite ran at load on all six boxes. Turn it on
+-- from the Settings tab (or set [Logging] File=1 in the character's settings file) when there is
+-- something to diagnose. Chat output and the in-UI status strip are unaffected either way - this
+-- only governs whether lines are mirrored to disk.
+--
+-- The setting has to be read HERE rather than in load_settings, which runs much later at the entry
+-- point: by then the log file would already have been created. So this is a small targeted read of
+-- just the one key, and load_settings reads it again into state for the UI.
+state.fileLog = false
+;(function()
     -- Resolve this script's own directory. debug.getinfo gives the .lua path;
     -- fall back to MQ's lua resource folder if that isn't usable.
     local dir
@@ -417,6 +436,27 @@ do
     pcall(function() charName = mq.TLO.Me.Name() or '' end)
     charName = charName:gsub('[^%w]', '')   -- EQ names are alphanumeric; strip anything odd for a safe filename
     local logName = (charName ~= '') and ('Lazcraft_' .. charName .. '_log.txt') or 'Lazcraft_log.txt'
+    -- Targeted peek: only the [Logging] File= key, before anything is written.
+    do
+        local sf = io.open((dir or '') .. 'Settings\\' .. ((charName ~= '') and charName or 'default') .. '.ini', 'r')
+        if sf then
+            local inLogging = false
+            for line in sf:lines() do
+                local sec = line:match('^%s*%[(.-)%]')
+                if sec then inLogging = (sec == 'Logging')
+                elseif inLogging then
+                    local v = line:match('^%s*File%s*=%s*(%S+)')
+                    if v then state.fileLog = (v == '1' or v:lower() == 'true') end
+                end
+            end
+            sf:close()
+        end
+    end
+    if not state.fileLog then
+        -- Nothing is created, rotated or announced. LOG_FILE_PATH stays nil, so log_to_file no-ops.
+        state.logFileCandidate = (dir or '') .. 'Logs\\' .. logName
+        return
+    end
     -- Logs live in <lazcraft>\Logs\ so the package folder isn't buried under one file per character.
     -- mkdir is fire-and-forget (harmless if it already exists); if the folder can't be used we fall
     -- back to the old location beside init.lua rather than silently losing logging.
@@ -427,6 +467,7 @@ do
         local probe = io.open(LOG_FILE_PATH, 'a')
         if probe then probe:close() else LOG_FILE_PATH = (dir or '') .. logName end
     end
+    state.logFileCandidate = LOG_FILE_PATH   -- remembered so the toggle can turn logging on later
     local KEEP_SESSIONS = 10   -- keep this many recent runs; older ones roll off the top
     -- Instead of truncating, keep the last (KEEP_SESSIONS-1) sessions so this run becomes the
     -- newest of KEEP_SESSIONS. Each session begins with the '=== ... started' marker line.
@@ -466,6 +507,48 @@ do
         LOG_FILE_PATH = nil   -- couldn't open the file; disable file logging quietly
         if LOG_FH then pcall(function() LOG_FH:close() end); LOG_FH = nil end
     end
+end)()
+
+-- Turn the file log on or off at runtime, from the Settings tab. Turning it ON creates the file and
+-- writes the session header immediately, so the very next line is captured; turning it OFF closes the
+-- handle rather than leaving one open on a file nothing is writing to.
+state.set_file_log = function(on)
+    state.fileLog = on and true or false
+    if not state.fileLog then
+        if LOG_FH then pcall(function() LOG_FH:close() end); LOG_FH = nil end
+        LOG_FILE_PATH = nil
+        printf('\\ag[Tradeskill]\\ax file logging OFF.')
+        return
+    end
+    LOG_FILE_PATH = state.logFileCandidate or LOG_FILE_PATH
+    if not LOG_FILE_PATH then printf('\\ar[Tradeskill]\\ax no log path resolved.'); return end
+    local fh = io.open(LOG_FILE_PATH, 'a')
+    if not fh then
+        LOG_FILE_PATH = nil
+        printf('\\ar[Tradeskill]\\ax could not open %s - logging stays off.', tostring(state.logFileCandidate))
+        return
+    end
+    fh:write(string.format('=== Lazcraft log - started %s [build %s] ===\n',
+        os.date('%Y-%m-%d %H:%M:%S'), state.BUILD_TAG or '?'))
+    fh:close()
+    printf('\\ag[Tradeskill]\\ax file logging ON -> %s', LOG_FILE_PATH)
+end
+
+-- WHICH CONFIG SET IS INSTALLED. The updater writes installed.txt recording what it last put in
+-- this folder, including a stamp for the config files. Reading it back means the UI can answer "are
+-- my recipes and vendor lists current" without a network call - and, more usefully, means a bug
+-- report carries the config version alongside the code version. Absent file = never updated, or
+-- installed by hand; say so rather than inventing a version.
+state.read_installed_stamp = function(dir)
+    local fh = io.open((dir or '') .. 'installed.txt', 'r')
+    if not fh then return nil end
+    local cfg
+    for line in fh:lines() do
+        local v = line:match('^#%s*config%s+(%S+)')
+        if v then cfg = v end
+    end
+    fh:close()
+    return cfg
 end
 
 -- ---------------------------------------------------------------------------
@@ -521,6 +604,13 @@ end
 -- selections and any recipes they've hand-added to a leveling path (which otherwise reset on
 -- reload). Auto-saved on change; loaded once at startup.
 state.customPathAdditions = {}   -- [pathName] = { recipeName, ... }  (persisted per character)
+
+
+-- The single place that knows how to start a mule helper. Both call sites route through it so the two
+-- cannot drift - the second used to be a bare '/lua run TradeskillListener' buried in a retry.
+state.start_mule_helper = function(char)
+    state.peer_cmdf(char, '/lua run Lazcraft worker %s', mq.TLO.Me.Name() or '')
+end
 state.illusionName = ''       -- faction-zone illusion (Felwithe/Jaggedpine): Name + Type (Spell/Item/AA)
 state.illusionType = 'Spell'  -- 'Spell' | 'Item' | 'AA'
 state.shrinkName   = ''       -- optional shrink before a buy/craft approach; blank Name = never pause to shrink
@@ -575,6 +665,16 @@ state.load_settings = function()
             -- skip blanks/comments
         elseif line:sub(1, 1) == '[' then
             section = line:sub(2, -2)
+        elseif section == 'Logging' then
+            local k, v = line:match('^(.-)=(.*)$')
+            if k == 'File' then state.fileLog = (v == '1' or (v or ''):lower() == 'true') end
+        elseif section == 'TSL' then
+            -- Producer settings, formerly owned by TradeskillListener's own window. GemSlot is the
+            -- spell gem an imbue is memmed into WHEN IT ISN'T ALREADY MEMMED somewhere; ManaTome is
+            -- the exact in-game name of the mana-regen clicky to fire before medding (blank = none).
+            local k, v = line:match('^(.-)=(.*)$')
+            if k == 'GemSlot' then state.tslGemSlot = tonumber(v) or state.tslGemSlot
+            elseif k == 'ManaTome' then state.tslManaTome = v or '' end
         elseif section == 'Speed' then
             local k, v = line:match('^(.-)=(.*)$')
             if k and v and state.speedLevels and state.speedLevels[k] and state.set_speed then
@@ -642,24 +742,17 @@ state.load_settings = function()
 end
 state.save_settings = function()
     if state._loadingSettings then return end
-    -- Preserve the listener's imbue gem slot. The TSL UI is the ONLY thing that SETS it, but it lives
-    -- in this same per-character file - so read its current value off disk and re-emit it below,
-    -- otherwise this wholesale rewrite would drop it. (Casters run both the suite and the listener.)
-    local tslGemSlot
-    do
-        local rf = io.open(state.settings_path(), 'r')
-        if rf then
-            for line in rf:lines() do
-                local gv = line:match('^GemSlot%s*=%s*(%d+)')
-                if gv then tslGemSlot = gv end
-            end
-            rf:close()
-        end
-    end
     local fh = io.open(state.settings_path(), 'w')
     if not fh then return end
     fh:write('; Lazcraft per-character settings - auto-saved, safe to edit.\n\n')
-    if tslGemSlot then fh:write('[TSL]\nGemSlot=' .. tslGemSlot .. '\n\n') end
+    -- Producer settings. These used to be owned by TradeskillListener, which meant this wholesale
+    -- rewrite had to read the old value back off disk to avoid dropping it. LazCraft owns them now,
+    -- so they are written from state like everything else. Existing [TSL] GemSlot lines still load.
+    fh:write('[Logging]\n')
+    fh:write('File=' .. (state.fileLog and '1' or '0') .. '\n\n')
+    fh:write('[TSL]\n')
+    fh:write('GemSlot=' .. tostring(state.tslGemSlot or 8) .. '\n')
+    fh:write('ManaTome=' .. tostring(state.tslManaTome or '') .. '\n\n')
     fh:write('[Speed]\n')
     for _, k in ipairs({ 'combinePace', 'placePace', 'combineSettle', 'autoinvPace', 'failSettle' }) do
         if state.speedSel and state.speedSel[k] then fh:write(k .. '=' .. state.speedSel[k] .. '\n') end
@@ -832,7 +925,7 @@ end
 -- any peer MQ-TLO expression works - 'Zone.ShortName', 'Me.PctHPs', 'Me.CombatState', 'CountBuffs', etc.
 -- CAVEAT: the query is a raw TLO expression sent through /dquery, so expressions with SPACES or quotes
 -- (e.g. FindItemCount[=Powder of Ro]) are fragile to escape over the wire - that's exactly why item
--- supply goes through the TradeskillListener (clean command, peer parses the name locally) rather than
+-- supply goes through the worker (clean command, peer parses the name locally) rather than
 -- a direct dquery. Use this for simple, space-free reads.
 state.dannet_query = function(peer, query, timeout)
     if not peer or peer == '' or not query or query == '' then return '' end
@@ -1230,6 +1323,14 @@ local function load_config()
     -- exclusion on the lazcraft folder (or moving the install off the Desktop). Nothing in Lua can make
     -- the OS release a scan-locked file faster, but we avoid redundant file opens below to cut exposure.
     local ok, err = pcall(function()
+    -- LEAN LOAD FOR A MULE. These three files exist for the crafter. A worker opens its bank, hands
+    -- things over and stops - it never crafts, never combines at a station and never researches, so
+    -- parsing them buys nothing and costs seconds. The log says which were skipped rather than being
+    -- silent about it, so a worker that misbehaves is not a mystery.
+    if LC_WORKER then
+        printf_log('worker: skipping tradeskills.ini (never crafts)')
+        state.iniPath = nil
+    else
     local path = resolve_ini_path()
     state.iniPath = path
     printf_log('load_config: reading recipes from %s', path or '(no path)')
@@ -1384,11 +1485,14 @@ local function load_config()
         end
     end
 
+    end   -- end of the crafter-only recipe load
+
     -- Load stations.ini - maps station names to { zone, loc } entries.
     -- Built by MerchantScanner's Stations tab. Multiple entries per station
     -- name are supported (one per zone). Keyed as stationName -> { zoneName -> loc }
-    local stationPath = state.config_read('stations.ini')
     state.stationLocs = {}  -- stationName -> { {zone=z, loc=l}, ... }
+    local stationPath = (not LC_WORKER) and state.config_read('stations.ini') or nil
+    if LC_WORKER then printf_log('worker: skipping stations.ini (no combines off the crafter)') end
     if stationPath and file_exists(stationPath) then
         local sSections, _ = parse_ini_file(stationPath)
         local stationCount = 0
@@ -1415,8 +1519,10 @@ local function load_config()
     -- the engine crafts them by their class-keyed name; [Research:<class>_<level>]
     -- sections build the class -> level -> names index the tab filters on.
     state.researchIndex   = {}   -- [class] = { [level] = { name, ... } }
+    if LC_WORKER then printf_log('worker: skipping research.ini (not needed off the crafter)') end
     state.researchClasses = {}   -- sorted unique class names
-    local researchPath = state.config_read('research.ini') or state.config_read('research_ini.ini')
+    local researchPath = (not LC_WORKER)
+        and (state.config_read('research.ini') or state.config_read('research_ini.ini')) or nil
     if researchPath then
         local rSections, rOrder = parse_ini_file(researchPath)
         local recipeCount = 0
@@ -2791,7 +2897,7 @@ local function ts_set_response(kind)
         }
     end
 end
--- LISTENER LIVENESS. Every site that needed a listener used to fire '/lua run TradeskillListener'
+-- WORKER LIVENESS. Every site that needed a helper used to fire '/lua run TradeskillListener'
 -- unconditionally and then sleep two or three seconds, whether or not one was already running. That
 -- is a fixed wait standing in for knowing: it costs the full delay when the listener was already up,
 -- and it proceeds regardless when the listener is slow, so the work is sent into nothing.
@@ -2824,8 +2930,8 @@ function state.ensure_listener(char)
     -- No answer: it is dead, crashed, or timed out. Start one and wait for it to speak, up to 8s.
     -- Polling for the answer rather than sleeping a fixed 2s means a slow start still works and a
     -- fast one is not punished.
-    printf_log('[listener] %s did not answer - starting one', char)
-    state.peer_cmdf(char, '/lua run TradeskillListener')
+    printf_log('[listener] %s did not answer - starting a worker', char)
+    state.start_mule_helper(char)
     deadline = mq.gettime() + 8000
     while mq.gettime() < deadline do
         mq.delay(100); mq.doevents()
@@ -2851,6 +2957,34 @@ mq.bind('/ts_fail', ts_set_response('fail'))
 mq.bind('/ts_qdone', function(total)
     supplyResponse = { type = 'qdone', item = nil, qty = tonumber(total) or 0 }
 end)
+
+-- BUSY, NOT EMPTY. A helper that is mid-summon or mid-craft used to have two bad options: do the work
+-- anyway (two jobs fighting over one cursor) or stay silent (we sit out the full 30s timeout and then
+-- conclude it has nothing). Neither is true. /ts_busy is the third answer - "I have it, I am working" -
+-- and it arrives in milliseconds. The distinction matters downstream: a 'none' marks the item
+-- exhausted and we stop asking for the rest of the run, whereas a 'busy' peer is worth asking again.
+-- Args: <who> <reason> [encoded].  GLOBAL: this chunk is at Lua's 200-local ceiling.
+peerBusy = {}                     -- lowercase name -> { reason = , when = }
+mq.bind('/ts_busy', function(who, reason, encoded)
+    if not who or who == '' then return end
+    peerBusy[who:lower()] = { reason = reason or 'busy', when = mq.gettime() }
+    supplyResponse = {
+        type = 'busy',
+        item = (encoded and encoded ~= '') and namecodec.decode(encoded) or nil,
+        qty  = 0,
+    }
+    printf_log('%s has it but is busy (%s) - leaving it alone.', who, reason or 'busy')
+end)
+
+-- Did anyone tell us they were busy in the last minute? Used to decide whether an item that came back
+-- empty is genuinely unavailable (stop asking) or merely unavailable RIGHT NOW (ask again later).
+state.anyone_busy_recently = function(ms)
+    ms = ms or 60000
+    for _, b in pairs(peerBusy) do
+        if (mq.gettime() - (b.when or 0)) < ms then return true end
+    end
+    return false
+end
 
 -- DIAGNOSTIC: /ts_zones - list every networked bot and the zone we read for it (via /dquery), flagging
 -- the ones in the Marr/PoK hubs (reachable for cross-zone supply). Read-only; safe to run anytime.
@@ -2896,7 +3030,7 @@ mq.bind('/tsprobe', function(bot, encoded)
     local item = namecodec.decode(encoded)
     local function trial(label, send)
         state.availReplies = {}; state.availHolders = {}
-        send(('/lua run TradeskillListener'))
+        send('/lua run Lazcraft worker ' .. (mq.TLO.Me.Name() or ''))
         mq.delay(3000)
         send(('/ts_check %s %s'):format(me, encoded))
         local deadline = mq.gettime() + 3500
@@ -3273,9 +3407,35 @@ local supplyExhausted = {}  -- tracks items we've already tried and failed to ge
 -- Accept an incoming trade on THIS toon. E3 won't auto-confirm trades on the active main driver, so
 -- when a mule fills our trade window we click the Trade button ourselves (and handle the yes/no
 -- confirmation if one pops). Called from the receive-wait loops while a mule is delivering.
+-- The mule says so when its side is fully loaded. Set by /ts_loaded, cleared once we act on it.
+-- Global, not local: this chunk is at Lua's 200-local ceiling.
+tradeLoadedAt = 0
+pcall(function() mq.bind('/ts_loaded', function(units, slots)
+    tradeLoadedAt = mq.gettime()
+    printf_log('  mule finished loading: %s unit(s) across %s slot(s).', tostring(units), tostring(slots))
+end) end)
+
 state.accept_open_trade = function()
     if not mq.TLO.Window('TradeWnd').Open() then return false end
-    mq.delay(600)                                  -- let the mule finish placing every slot
+    -- WAIT FOR THE MULE TO SAY IT IS DONE, rather than guessing at a delay. This was a flat 600ms with
+    -- the comment "let the mule finish placing every slot" - right intent, wrong mechanism. The window
+    -- appears the moment the FIRST stack lands; loading four takes seconds. So we confirmed a one-item
+    -- trade and the mule had to open a fresh window for each of the rest. Every batch was still N trades,
+    -- which is exactly what was being seen in game while the listener log said "across 4 slots".
+    -- Falls back to the old behaviour after 6s so an older listener, or a trade started by a person,
+    -- still completes - it just costs the wait first.
+    local waited = 0
+    while waited < 6000 do
+        if tradeLoadedAt > 0 then break end
+        mq.doevents()
+        mq.delay(100); waited = waited + 100
+        if not mq.TLO.Window('TradeWnd').Open() then return false end
+    end
+    if tradeLoadedAt == 0 then
+        printf_log('  no load signal from the mule after %.0fs - confirming anyway.', waited / 1000)
+        mq.delay(600)
+    end
+    tradeLoadedAt = 0
     if not mq.TLO.Window('TradeWnd').Open() then return false end
     mq.cmd('/notify TradeWnd TRDW_Trade_Button leftmouseup')
     mq.delay(400)
@@ -3304,7 +3464,7 @@ local function group_check(itemNames)
     end
     -- Item counts now come STRAIGHT FROM DanNet: FindItemCount[=name] over a quoted /dquery (proven
     -- ~66ms, spaces AND apostrophes both pass on Laz). No listener startup, no /ts_check, no reply-gather
-    -- window - the TradeskillListener is only needed for the actual delivery + casting now. peer_item_counts
+    -- window - the worker is only needed for the actual delivery + casting now. peer_item_counts
     -- fills availReplies[item]=total and availHolders[item]={mule=qty}, so every delivery consumer is unchanged.
     local avail = state.peer_item_counts(mules, itemNames)
     local got = 0
@@ -3316,6 +3476,7 @@ end
 local function request_supply(itemName, needed, recipient)
     needed = needed or math.huge   -- how many we want before we can stop early
     -- Build mule list from current group members
+    sawBusy = false   -- global (200-local ceiling): set when any peer answers /ts_busy this pass
     if supplyExhausted[itemName] then
         printf_log('Supply of %s already exhausted this session - skipping.', itemName)
         return 0
@@ -3381,6 +3542,7 @@ local function request_supply(itemName, needed, recipient)
         while mq.gettime() < deadline
               and supplyResponse.type ~= 'done'
               and supplyResponse.type ~= 'fail'
+              and supplyResponse.type ~= 'busy'
               and supplyResponse.type ~= 'none' do
             mq.doevents()
             state.accept_open_trade()   -- click Trade ourselves (E3 won't on the main driver)
@@ -3405,6 +3567,11 @@ local function request_supply(itemName, needed, recipient)
         elseif supplyResponse.type == 'fail' then
             printf_log('Trade failed with %s.', muleName)
             state.peer_cmdf(muleName, '/ts_cancel %s', myName)
+        elseif supplyResponse.type == 'busy' then
+            -- It answered, it just has its own job running. Move to the next holder WITHOUT a
+            -- /ts_cancel (there is nothing of ours to cancel over there) and without treating this
+            -- as evidence the item is unavailable - the exhausted check below skips on busy.
+            sawBusy = true
         else
             -- 'none' or timeout
             printf_log('%s does not have %s.', muleName, itemName)
@@ -3428,8 +3595,14 @@ local function request_supply(itemName, needed, recipient)
                 return xz
             end
         end
-        printf_log('No %s available from any same-zone character - will not retry.', itemName)
-        supplyExhausted[itemName] = true
+        if sawBusy then
+            -- Somebody HAS it and was working. Marking it exhausted would stop us asking for the rest
+            -- of the run over a condition that clears in a minute, so leave it retryable.
+            printf_log('No %s delivered - a holder was busy. Leaving it retryable.', itemName)
+        else
+            printf_log('No %s available from any same-zone character - will not retry.', itemName)
+            supplyExhausted[itemName] = true
+        end
     end
     return totalReceived
 end
@@ -3692,6 +3865,7 @@ local function request_all(itemName)
             while mq.gettime() < deadline
                   and supplyResponse.type ~= 'done'
                   and supplyResponse.type ~= 'fail'
+                  and supplyResponse.type ~= 'busy'
                   and supplyResponse.type ~= 'none' do
                 mq.doevents()
                 state.accept_open_trade()   -- click Trade ourselves (E3 won't on the main driver)
@@ -3738,6 +3912,7 @@ state.ask_listening_char = function(charName, itemName, recipient, mode)
     while mq.gettime() < deadline
           and supplyResponse.type ~= 'done'
           and supplyResponse.type ~= 'fail'
+          and supplyResponse.type ~= 'busy'
           and supplyResponse.type ~= 'none' do
         mq.doevents()
         state.accept_open_trade()   -- click Trade ourselves (E3 won't on the main driver)
@@ -3828,7 +4003,8 @@ state.request_supply_grouped = function(items, targetChar)
             supplyResponse = { type = nil }
             state.peer_cmdf(charName, '/ts_qrun %s', myName)
             local deadline = mq.gettime() + 120000
-            while mq.gettime() < deadline and supplyResponse.type ~= 'qdone' do
+            while mq.gettime() < deadline and supplyResponse.type ~= 'qdone'
+                                          and supplyResponse.type ~= 'busy' do
                 mq.doevents()
                 state.accept_open_trade()   -- click Trade ourselves (E3 won't on the main driver)
                 if supplyResponse.type == 'have' then
@@ -4233,28 +4409,99 @@ end
 -- one outbound path. It mirrors the listener's proven trade_item sequence: nav to the peer, target it,
 -- pick the stack (QuantityWnd sets the exact count), drop it on the target to open/fill the trade, then
 -- click Trade - the peer's own listener clicks ITS side (that's how it auto-accepts), so the window
--- closing = both accepted. Returns how many we handed over. The peer must be running TradeskillListener;
+-- closing = both accepted. Returns how many we handed over. The peer must be running a Lazcraft worker;
 -- we start it first. Assumes E3 is already paused by the job (a live E3 grabs the cursor mid-pickup).
+-- Hand items to a peer. TWO SHAPES, one body:
+--     state.deliver_to_peer(peer, 'Silver Bar', 40)                  one item, as before
+--     state.deliver_to_peer(peer, { {name='Silver Bar', qty=40},     several, ONE trip
+--                                   {name='Gold Bar',  qty=20} })
+-- The trade window holds 8 slots and this always filled them - just with eight stacks of the SAME item.
+-- Carrying a list instead means a six-item resupply is one navigate-target-trade round trip rather than
+-- six, which is where nearly all the wall-clock time goes. That is what the listener's /ts_qadd + /ts_qrun
+-- pair exists to do, and it is the last thing standing between LazCraft and doing its own deliveries.
+-- The single-item form is untouched on purpose: the three existing callers keep working without edits,
+-- and the batch form is additive rather than a migration.
+-- Returns total pieces handed over, and a per-item table.
 state.deliver_to_peer = function(peerName, itemName, qty)
-    qty = qty or item_count(itemName)
-    if qty <= 0 or item_count(itemName) <= 0 then
-        printf_log('Nothing to hand %s: no %s on hand.', peerName, itemName); return 0
+    local batch
+    if type(itemName) == 'table' then
+        batch = {}
+        for _, e in ipairs(itemName) do
+            local nm = e.name or e[1]
+            local q  = e.qty or e[2] or item_count(nm)
+            if nm and q and q > 0 then batch[#batch + 1] = { name = nm, qty = q } end
+        end
+    else
+        batch = { { name = itemName, qty = qty or item_count(itemName) } }
     end
-    state.ensure_listener(peerName)   -- so it can click its side of the trade
+    -- Drop anything we do not actually hold, so an empty entry cannot burn a trip.
+    local live = {}
+    for _, e in ipairs(batch) do
+        if e.qty > 0 and item_count(e.name) > 0 then live[#live + 1] = e end
+    end
+    batch = live
+    if #batch == 0 then
+        printf_log('Nothing to hand %s: none of the requested items on hand.', peerName); return 0, {}
+    end
+    local firstName = batch[1].name
+    -- A WORKER NEVER NEEDS TO START ANYTHING. This exists so a crafter handing items to a mule can be
+    -- sure the mule is up to click its side. Running as a worker the direction is reversed - we are
+    -- delivering TO the crafter, which by definition is already running, since it just asked us for this.
+    -- Left in, the worker tried to start a worker on the crafter, waited out the full liveness timeout,
+    -- and logged "Antilerd never came up - its work will fail" before delivering perfectly well anyway.
+    -- Eight seconds per hand-off for a question with a known answer.
+    if not LC_WORKER then
+        state.ensure_listener(peerName)   -- so it can click its side of the trade
+    end
 
     local pid = mq.TLO.Spawn(string.format('pc "%s"', peerName)).ID() or 0
-    if pid == 0 then printf_log('Cannot find %s to deliver %s.', peerName, itemName); return 0 end
+    if pid == 0 then printf_log('Cannot find %s to deliver %s.', peerName, firstName); return 0, {} end
     if not nav_to_spawn(pid, peerName) then
-        printf_log('Could not reach %s to deliver %s.', peerName, itemName); return 0
+        printf_log('Could not reach %s to deliver %s.', peerName, firstName); return 0, {}
     end
     mq.cmdf('/target pc %s', peerName)
     mq.delay(500, function() return (mq.TLO.Target.Name() or ''):lower() == peerName:lower() end)
     if (mq.TLO.Target.Name() or ''):lower() ~= peerName:lower() then
-        printf_log('Could not target %s.', peerName); return 0
+        printf_log('Could not target %s.', peerName); return 0, {}
     end
 
-    local placed, slots = 0, 0
-    while placed < qty and slots < 8 and item_count(itemName) > 0 do
+    -- OUTER loop over the batch, INNER loop over that item's stacks. The 8-slot cap is on the WINDOW,
+    -- so it is shared across every item - eight slots total, not eight per item.
+    -- OPEN EVERY BAG, DO THE WHOLE TRADE, CLOSE THEM ONCE AT THE END.
+    -- The versions before this opened a bag immediately before reaching into it, which is a race - the
+    -- container window needs a moment to exist before a slot click can land on it, and when it does not
+    -- the click falls through to the bag and takes the WHOLE stack. Hence "grabbed 273 of Malt but
+    -- wanted 30". The retry then closed and reopened the same bag, so the fix was fighting the cause.
+    -- Open once, up front, all of them; nothing toggles while items are being picked up; close once at
+    -- the end. No tracking across deliveries is needed because open and close are balanced here.
+    local bagOpened = {}
+    for b = 1, 10 do
+        if (mq.TLO.Me.Inventory('pack' .. b).Container() or 0) > 0 then
+            mq.cmdf('/itemnotify pack%d rightmouseup', b)
+            mq.delay(60)
+            bagOpened[#bagOpened + 1] = b
+        end
+    end
+    if #bagOpened > 0 then mq.delay(350) end   -- one settle for all of them, not one per grab
+
+    -- Called on EVERY exit below. Leaving ten container windows open would be untidy on the crafter and
+    -- would break the next delivery, which opens them again - right-click toggles.
+    local function close_bags()
+        for _, b in ipairs(bagOpened) do
+            mq.cmdf('/itemnotify pack%d rightmouseup', b)
+            mq.delay(40)
+        end
+        bagOpened = {}
+    end
+
+    local placed, slots, perItem = 0, 0, {}
+    for _, entry in ipairs(batch) do
+        if slots >= 8 then break end
+        local itemName = entry.name
+        local qty      = entry.qty
+        local before   = placed
+        local regrabs  = 0     -- bounded retries when a shut bag hands us the whole stack
+    while placed - before < qty and slots < 8 and item_count(itemName) > 0 do
         clear_cursor()
         -- Locate the item's bag/slot so we can grab EXACTLY `want` via the split dialog. (find_item_slot
         -- is defined later in the file, so the search is inlined here.)
@@ -4274,7 +4521,7 @@ state.deliver_to_peer = function(peerName, itemName, qty)
         end
         if not bagNum then printf_log('Could not locate %s in bags for %s.', itemName, peerName); break end
         local slotStack = mq.TLO.Me.Inventory('pack' .. bagNum).Item(slotNum).Stack() or 1
-        local want = math.min(qty - placed, slotStack)
+        local want = math.min(qty - (placed - before), slotStack)
 
         -- Grab exactly `want` using the SAME gesture the bank withdraw does ~reliably: right-click the
         -- bag to OPEN it (a closed bag grabs the whole stack), left-click the slot to pop the split, then
@@ -4282,8 +4529,7 @@ state.deliver_to_peer = function(peerName, itemName, qty)
         -- (accepting early takes the full-stack default - the over-grab bug). SINGLE grab, no retry/
         -- put-back loop (that regressed it in the bank). On failure: /keypress esc (the REAL cancel; the
         -- Cancel button PULLS THE STACK) and stop short - never over-deliver.
-        mq.cmdf('/itemnotify pack%d rightmouseup', bagNum)   -- open the bag so the split pops
-        mq.delay(350)
+        -- Bags are already open and settled; nothing is toggled here.
         mq.cmdf('/itemnotify in pack%d %d leftmouseup', bagNum, slotNum)
         mq.delay(800, function() return mq.TLO.Window('QuantityWnd').Open() or (mq.TLO.Cursor.ID() or 0) > 0 end)
         if mq.TLO.Window('QuantityWnd').Open() then
@@ -4310,30 +4556,57 @@ state.deliver_to_peer = function(peerName, itemName, qty)
         local stackSize = mq.TLO.Cursor.Stack() or 1
         if stackSize > want then
             -- No split popped and we grabbed the whole slot - put it back rather than over-deliver.
-            printf_log('Hand-off: grabbed %d of %s but wanted %d - putting back (handed %d, no over-deliver).',
-                stackSize, itemName, want, placed)
+            -- A whole stack came, so the bag was shut after all. Put it back, forget the bag so it gets
+            -- reopened, and allow a bounded number of retries.
+            -- BOUNDED deliberately: the while condition advances on `slots` and on item_count, and a
+            -- failed grab moves neither - so retrying without a counter is an infinite loop that hangs
+            -- the crafter mid-delivery. Three attempts, then give up on this item rather than spin.
+            -- Put it back and try the grab again. NOTHING is toggled here: the bag is already open, and
+            -- closing/reopening it was the previous version fighting its own cause.
             mq.cmd('/autoinventory'); mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-            break
-        end
-        mq.cmd('/notify TargetWindow Target_HP leftmouseup')   -- drop on target = open/fill trade
-        mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-        if (mq.TLO.Cursor.ID() or 0) > 0 then
-            mq.cmd('/click left target')
+            regrabs = regrabs + 1
+            if regrabs >= 3 then
+                printf_log('Hand-off: %s kept coming as a whole stack (wanted %d) - giving up on it after %d tries.',
+                    itemName, want, regrabs)
+                break
+            end
+            printf_log('Hand-off: grabbed %d of %s but wanted %d - putting it back and retrying (%d/3).',
+                stackSize, itemName, want, regrabs)
+        else
+            -- PLACEMENT ONLY HAPPENS ON THE ELSE. Previously this fell straight through from the
+            -- put-back branch above: /autoinventory returned the stack to the bag, the drop then did
+            -- nothing because the cursor was empty, and `placed = placed + stackSize` counted it anyway.
+            -- That is how a request for 30 Malt reported 273 handed over - the retry was crediting the
+            -- whole stack it had just put back, and the same for 10 Yeast becoming 91.
+            mq.cmd('/notify TargetWindow Target_HP leftmouseup')   -- drop on target = open/fill trade
             mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+            if (mq.TLO.Cursor.ID() or 0) > 0 then
+                mq.cmd('/click left target')
+                mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+            end
+            if (mq.TLO.Cursor.ID() or 0) > 0 then
+                printf_log('Could not place %s on %s.', itemName, peerName)
+                mq.cmd('/autoinventory'); break
+            end
+            placed = placed + stackSize
+            slots = slots + 1
         end
-        if (mq.TLO.Cursor.ID() or 0) > 0 then
-            printf_log('Could not place %s on %s.', itemName, peerName)
-            mq.cmd('/autoinventory'); break
-        end
-        placed = placed + stackSize
-        slots = slots + 1
+    end
+        perItem[itemName] = (perItem[itemName] or 0) + (placed - before)
     end
 
     if placed == 0 then
         if mq.TLO.Window('TradeWnd').Open() then mq.cmd('/notify TradeWnd TRDW_Cancel_Button leftmouseup') end
-        return 0
+        close_bags()
+        return 0, {}
     end
-    printf_log('Handing %d %s to %s - confirming trade...', placed, itemName, peerName)
+    local what = (#batch == 1) and string.format('%d %s', placed, batch[1].name)
+                                or string.format('%d piece(s) across %d item(s)', placed, #batch)
+    -- TELL THE RECEIVER WE HAVE FINISHED LOADING before either side confirms. Without it the receiver
+    -- guesses at a delay, and a guess that is short completes a one-item trade while the rest of the
+    -- batch is still going in - exactly what made every listener batch turn back into N trades.
+    pcall(function() state.peer_cmdf(peerName, '/ts_loaded %d %d', placed, slots) end)
+    printf_log('Handing %s to %s - confirming trade...', what, peerName)
     mq.delay(300)
     mq.cmd('/notify TradeWnd TRDW_Trade_Button leftmouseup')
     mq.delay(8000, function() return not mq.TLO.Window('TradeWnd').Open() end)
@@ -4343,10 +4616,14 @@ state.deliver_to_peer = function(peerName, itemName, qty)
     end
     if mq.TLO.Window('TradeWnd').Open() then
         printf_log('Trade with %s still open after confirm - cancelling.', peerName)
-        mq.cmd('/notify TradeWnd TRDW_Cancel_Button leftmouseup'); return 0
+        mq.cmd('/notify TradeWnd TRDW_Cancel_Button leftmouseup'); close_bags(); return 0, {}
     end
-    printf_log('\\agHanded %d %s to %s.\\ax', placed, itemName, peerName)
-    return placed
+    printf_log('\\agHanded %s to %s.\\ax', what, peerName)
+    for nm, n in pairs(perItem) do
+        if #batch > 1 then printf_log('   %-34s %d', nm, n) end
+    end
+    close_bags()
+    return placed, perItem
 end
 
 -- Navigate to whichever merchant NPC is physically closest in the zone,
@@ -14019,7 +14296,7 @@ local function render_window()
 
                         -- Welcome / onboarding intro.
                         ImGui.Spacing()
-                        ImGui.TextWrapped("Lazcraft runs on the character doing the combines. Designed to level you to 300 on each tradeskill. If you're in a group, it can connect to group members to request items via TradeskillListener.lua with your group boxes in Marr's. To get started, you can click the tab and select your tradeskill.")
+                        ImGui.TextWrapped("Lazcraft runs on the character doing the combines. Designed to level you to 300 on each tradeskill. If you're in a group, it can connect to group members to request items - they run Lazcraft in worker mode, started automatically, with your group boxes in Marr's. To get started, you can click the tab and select your tradeskill.")
                         ImGui.Spacing()
                         ImGui.TextWrapped('One thing to know: a path will consume all stocked resources fully. But leveling paths are completely configurable, so you can choose your own adventure.')
                         ImGui.Spacing()
@@ -15335,11 +15612,30 @@ local function render_window()
                     ImGui.Text('Utilities')
                     ImGui.SameLine()
                     ImGui.TextColored(0.45, 0.75, 0.95, 1.0, 'LazCraft ' .. (state.VERSION or '?') .. '  (build ' .. (state.BUILD_TAG or '?') .. ')')
+                    ImGui.TextDisabled('config set: ' .. (state.configStamp or 'unknown (installed by hand - run update.bat)'))
                     ImGui.Spacing()
                     if ImGui.Button('Reload Config##ts_set_reload', UI.btn_w, UI.btn_h) then
                         load_config()
                     end
                     ImGui.TextDisabled('Bank Trophies & Tools is at the top of the window (works from any tab).')
+
+                    -- FILE LOGGING. Off by default: six characters each rotating a ten-session log at
+                    -- startup is cost nobody was reading. Turn it on when there is something to
+                    -- diagnose, reproduce the problem, then send the file. Chat output is unaffected.
+                    ImGui.Spacing()
+                    if ImGui.Checkbox then
+                        local wasLog = state.fileLog and true or false
+                        local nowLog = ImGui.Checkbox('Write a log file##ts_set_filelog', wasLog)
+                        if nowLog ~= wasLog then
+                            state.set_file_log(nowLog)
+                            state.save_settings()
+                        end
+                    end
+                    if state.fileLog then
+                        ImGui.TextDisabled('Logging to: ' .. tostring(state.logFileCandidate or '(resolving)'))
+                    else
+                        ImGui.TextDisabled('Off - turn this on before reproducing a problem, then send the log.')
+                    end
                     end)
                     if not _sok then ImGui.TextColored(0.95, 0.35, 0.35, 1.0, 'tab render error - see log'); printf_log('UI Settings tab render error: %s', tostring(_serr)) end
                     ImGui.EndTabItem()
@@ -15557,6 +15853,7 @@ end
 -- Load recipe/merchant/research config, then per-character settings, before the UI opens.
 load_config()
 state.load_settings()   -- per-character speed knobs + saved custom leveling-path recipes
+state.configStamp = state.read_installed_stamp(state.pkgDir)
 -- (Startup peer-zone prewarm removed: firing /dobserve for every DanNet peer at load could flood the
 --  command queue on a populated server and stall the client. peer_zone registers on-demand instead.)
 state.statusMsg = ''    -- don't leave "Loaded ..." lingering in the status strip
@@ -15601,6 +15898,34 @@ do
 end
 
 pcall(function() mq.bind('/tsui', ui_command) end)
+
+-- Plain-language alias for getting the window back. /tsui is the full command (show/hide/toggle/plan/
+-- stop), but after closing the window the thing you want is a name you can guess without remembering
+-- a subcommand - so this one always OPENS. On a worker there is no window to open: it never called
+-- imgui.init, so say what to do instead of silently doing nothing.
+-- A worker has no Settings tab to tick, and a worker is often exactly the box you need a log from.
+-- /lazlog on|off works in both roles; with no argument it reports the current state.
+pcall(function() mq.bind('/lazlog', function(arg)
+    arg = trim(tostring(arg or '')):lower()
+    if arg == 'on' or arg == '1' then
+        state.set_file_log(true); state.save_settings()
+    elseif arg == 'off' or arg == '0' then
+        state.set_file_log(false); state.save_settings()
+    else
+        printf('\\ag[Tradeskill]\\ax file logging is %s%s. Use \\ay/lazlog on\\ax or \\ay/lazlog off\\ax.',
+            state.fileLog and 'ON' or 'OFF',
+            state.fileLog and (' -> ' .. tostring(state.logFileCandidate or '?')) or '')
+    end
+end) end)
+
+pcall(function() mq.bind('/lazcraftui', function(...)
+    if LC_WORKER then
+        printf('\ay[Tradeskill]\ax this is a headless worker - no window. Restart it as \ay/lua run Lazcraft\ax for the UI.')
+        return
+    end
+    local sub = trim((select(1, ...)) or ''):lower()
+    if sub ~= '' then ui_command(...) else state.windowOpen = true end
+end) end)
 
 -- Test command for the upfront supply requests (the Request tab will drive the
 -- same engine). Usage:  /tsreq stack Fine Silk   |   /tsreq all Superb Animal Pelt
@@ -15869,8 +16194,558 @@ pcall(function() mq.bind('/lazpreload', function(...)
     state.pendingJob = { action = 'preload', recipeList = { { name = name, combines = combines } } }
 end) end)
 
-mq.imgui.init(scriptName, render_window)
-printf('\ag[Tradeskill]\ax UI open - \ay/lua run TradeskillSuite\ax or \ay/tsui toggle\ax')
+
+-- ---------------------------------------------------------------------------
+-- PRODUCER (ported from TradeskillListener). A caster mule MAKES an item on
+-- request instead of pulling it from a bank: enchanter mass-enchants, cleric
+-- gem imbues, spellcaster essences. This was the last thing only the listener
+-- could do, and the last reason to run it.
+--
+-- Defined at file scope, not inside the worker branch, so the main loop can
+-- drain the queue. Only a WORKER binds /ts_make; a crafter declines it.
+-- Everything lives on state.* - this chunk is at Lua's 200-local ceiling.
+-- ---------------------------------------------------------------------------
+
+-- Each entry: the spell to cast, the default gem, how many one cast yields (perCast), and the vendor
+-- reagents it consumes per cast. A cast can need more than one (the mana vials use a gem + a vial).
+-- A reagent flagged dropped=true is farmed/mule-supplied and is NEVER bought - we imbue what is on
+-- hand and stop when it runs out.
+state.PRODUCE = {
+    ['Large Block of Magic Clay'] = { spell = 'Superior Mass Enchant Clay',     gem = 8, perCast = 100, reagents = { { name = 'Large Block of Clay', per = 100 } } },
+    ['Enchanted Electrum Bar']    = { spell = 'Superior Mass Enchant Electrum', gem = 8, perCast = 100, reagents = { { name = 'Electrum Bar',        per = 100 } } },
+    ['Enchanted Silver Bar']      = { spell = 'Superior Mass Enchant Silver',   gem = 8, perCast = 100, reagents = { { name = 'Silver Bar',          per = 100 } } },
+    ['Enchanted Gold Bar']        = { spell = 'Superior Mass Enchant Gold',     gem = 8, perCast = 100, reagents = { { name = 'Gold Bar',            per = 100 } } },
+    ['Enchanted Platinum Bar']    = { spell = 'Superior Mass Enchant Platinum', gem = 8, perCast = 100, reagents = { { name = 'Platinum Bar',        per = 100 } } },
+    -- NOTE: Velium spell name was inferred from the pattern in the listener; confirm the exact Laz name.
+    ['Enchanted Velium Bar']      = { spell = 'Superior Mass Enchant Velium',   gem = 8, perCast = 100, reagents = { { name = 'Velium Bar',          per = 100 } } },
+
+    ['Vial of Clear Mana']     = { spell = 'Mass Clarify Mana', gem = 8, perCast = 5, reagents = { { name = 'Emerald',  per = 5 },  { name = 'Poison Vial', per = 5 } } },
+    ['Vial of Purified Mana']  = { spell = 'Mass Purify Mana',  gem = 8, perCast = 5, reagents = { { name = 'Ruby',     per = 20 }, { name = 'Poison Vial', per = 5 } } },
+    ['Vial of Distilled Mana'] = { spell = 'Mass Distill Mana', gem = 8, perCast = 5, reagents = { { name = 'Sapphire', per = 10 }, { name = 'Poison Vial', per = 5 } } },
+
+    ["Crude Spellcaster's Empowering Essence"]     = { spell = "Focus Mass Crude Spellcaster's Empowering Essence",     gem = 8, perCast = 5, reagents = {} },
+    ["Refined Spellcaster's Empowering Essence"]   = { spell = "Focus Mass Refined Spellcaster's Empowering Essence",   gem = 8, perCast = 5, reagents = {} },
+    ["Intricate Spellcaster's Empowering Essence"] = { spell = "Focus Mass Intricate Spellcaster's Empowering Essence", gem = 8, perCast = 5, reagents = {} },
+
+    -- Cleric gem imbues: a cast consumes 5 of the base gem and yields 5 imbued.
+    -- The Rose Quartz spell has NO "Star" in it; the reagent gem does.
+    ['Imbued Rose Quartz']    = { spell = 'Mass Imbue Rose Quartz',    gem = 8, perCast = 5, reagents = { { name = 'Star Rose Quartz', per = 5 } } },
+    ['Imbued Amber']          = { spell = 'Mass Imbue Amber',          gem = 8, perCast = 5, reagents = { { name = 'Amber',          per = 5 } } },
+    ['Imbued Jade']           = { spell = 'Mass Imbue Jade',           gem = 8, perCast = 5, reagents = { { name = 'Jade',           per = 5 } } },
+    ['Imbued Peridot']        = { spell = 'Mass Imbue Peridot',        gem = 8, perCast = 5, reagents = { { name = 'Peridot',        per = 5 } } },
+    ['Imbued Topaz']          = { spell = 'Mass Imbue Topaz',          gem = 8, perCast = 5, reagents = { { name = 'Topaz',          per = 5 } } },
+    ['Imbued Opal']           = { spell = 'Mass Imbue Opal',           gem = 8, perCast = 5, reagents = { { name = 'Opal',           per = 5 } } },
+    ['Imbued Sapphire']       = { spell = 'Mass Imbue Sapphire',       gem = 8, perCast = 5, reagents = { { name = 'Sapphire',       per = 5 } } },
+    ['Imbued Ruby']           = { spell = 'Mass Imbue Ruby',           gem = 8, perCast = 5, reagents = { { name = 'Ruby',           per = 5 } } },
+    ['Imbued Emerald']        = { spell = 'Mass Imbue Emerald',        gem = 8, perCast = 5, reagents = { { name = 'Emerald',        per = 5 } } },
+    -- Farmed / not vendor-sold - imbued from supplied gems, never bought:
+    ['Imbued Black Pearl']    = { spell = 'Mass Imbue Black Pearl',    gem = 8, perCast = 5, reagents = { { name = 'Black Pearl',    per = 5, dropped = true } } },
+    ['Imbued Plains Pebble']  = { spell = 'Mass Imbue Plains Pebble',  gem = 8, perCast = 5, reagents = { { name = 'Plains Pebble',  per = 5, dropped = true } } },
+    ['Imbued Ivory']          = { spell = 'Mass Imbue Ivory',          gem = 8, perCast = 5, reagents = { { name = 'Ivory',          per = 5, dropped = true } } },
+    ['Imbued Fire Opal']      = { spell = 'Mass Imbue Fire Opal',      gem = 8, perCast = 5, reagents = { { name = 'Fire Opal',      per = 5, dropped = true } } },
+    ['Imbued Black Sapphire'] = { spell = 'Mass Imbue Black Sapphire', gem = 8, perCast = 5, reagents = { { name = 'Black Sapphire', per = 5, dropped = true } } },
+    ['Imbued Diamond']        = { spell = 'Mass Imbue Diamond',        gem = 8, perCast = 5, reagents = { { name = 'Diamond',        per = 5, dropped = true } } },
+}
+
+-- Producer state. Globals for the same reason everything else here is.
+workerMakeQueue = {}        -- { { item=, qty=, sender=, encoded= } } drained by the main loop
+workerMaking    = false     -- true only while produce_make is actually running
+
+-- /memspell overwrites whatever is in the gem, and memming takes a few seconds, so poll the gem
+-- until it shows our spell rather than guessing a delay. No separate unmem is needed.
+state.mem_spell = function(gem, spellName)
+    if (mq.TLO.Me.Gem(gem).Name() or '') == spellName then return true end
+    mq.cmdf('/memspell %d "%s"', gem, spellName)
+    delay(10000, function() return (mq.TLO.Me.Gem(gem).Name() or '') == spellName end)
+    if (mq.TLO.Me.Gem(gem).Name() or '') ~= spellName then
+        printf_log('Could not memorize %s into gem %d.', spellName, gem)
+        return false
+    end
+    return true
+end
+
+-- Mana-regen clicky, fired once per med cycle to shorten the sit. Set ManaTome='' in the character's
+-- settings for a toon that doesn't have one. The pcalls guard the TLO lookup in case MQ's parser
+-- trips on an apostrophe in the name, and an on-cooldown /useitem is harmlessly ignored by the game.
+state.use_mana_tome = function()
+    local tome = state.tslManaTome or ''
+    if tome == '' then return end
+    local okC, cnt = pcall(function() return mq.TLO.FindItemCount('=' .. tome)() end)
+    if not okC or (cnt or 0) <= 0 then return end          -- not carrying it
+    local okR, ready = pcall(function() return mq.TLO.Me.ItemReady(tome)() end)
+    if not okR or not ready then return end                -- on cooldown
+    printf_log('Clicking %s to speed mana regen...', tome)
+    mq.cmdf('/useitem "%s"', tome)
+    -- Wait for the cast to BEGIN, then to FINISH. The caller sits immediately after, and sitting
+    -- mid-cast would interrupt the tome. An instant click just times the begin-wait out harmlessly.
+    delay(3000, function() return (mq.TLO.Me.Casting.ID() or 0) > 0 end)
+    if (mq.TLO.Me.Casting.ID() or 0) > 0 then
+        delay(12000, function() return (mq.TLO.Me.Casting.ID() or 0) == 0 end)
+    end
+    mq.delay(300)
+end
+
+-- Sit and med under 30% mana, stand again over 90%. Cheap for Enchant Clay, but it keeps the
+-- pricier producer spells from running the caster dry mid-batch.
+state.med_if_low = function()
+    if (mq.TLO.Me.PctMana() or 100) < 30 then
+        printf_log('Mana low (%d%%) - sitting to med...', mq.TLO.Me.PctMana() or 0)
+        state.use_mana_tome()          -- it's a cast: fire it standing, before we sit
+        mq.cmd('/sit')
+        local deadline = mq.gettime() + 300000
+        while mq.gettime() < deadline do
+            if (mq.TLO.Me.PctMana() or 100) > 90 then break end
+            mq.doevents(); mq.delay(1000)
+        end
+        printf_log('Mana back to %d%% - resuming.', mq.TLO.Me.PctMana() or 0)
+    end
+    if mq.TLO.Me.Sitting() then mq.cmd('/stand'); mq.delay(500) end
+end
+
+-- Which gem to use: if the spell is ALREADY memmed somewhere, cast from that slot so we don't
+-- disturb the caster's own layout. Otherwise fall back to the configured GemSlot.
+state.resolve_gem = function(cfg)
+    local g = mq.TLO.Me.Gem(cfg.spell)()
+    if type(g) == 'number' and g > 0 then return g end
+    return state.tslGemSlot or cfg.gem or 8
+end
+
+-- Cast until we hold wantTotal of product. Target-driven - it verifies the count actually climbed
+-- after each cast - so it's robust to fizzles and to a variable per-cast yield.
+state.cast_until = function(cfg, product, wantTotal, gem)
+    gem = gem or state.resolve_gem(cfg)
+    local attempts = 0
+    -- Budget = the ideal cast count plus room for genuine misses (interrupt, real fizzle). The loop
+    -- exits the instant we reach wantTotal, so a roomy buffer never overshoots. NOTE the historical
+    -- trap: the summoned stack sits on the CURSOR and /autoinventory won't stow mid-cast, so the
+    -- count looked flat and every cast read as a fizzle. clear_cursor waits out Me.Casting first.
+    local maxAttempts = math.ceil(wantTotal / cfg.perCast) + 10
+    while item_count(product) < wantTotal and attempts < maxAttempts do
+        if state.stopRequested then break end
+        -- Honour the suite's own Pause: the current cast finishes, then we hold here. Casting is the
+        -- one long-running worker job, so without this Pause would appear to do nothing on a caster.
+        while state.pauseRequested and not state.stopRequested do mq.doevents(); mq.delay(200) end
+        if state.stopRequested then break end
+        attempts = attempts + 1
+        local short
+        for _, r in ipairs(cfg.reagents) do
+            if item_count(r.name) < r.per then short = r.name; break end
+        end
+        if short then printf_log('Out of %s - stopping.', short); break end
+
+        state.med_if_low()
+        -- Free the cursor before casting or the cast won't fire. /autoinventory silently no-ops while
+        -- a merchant or bank window is open (e.g. a lingering reagent-buy window), so close those first.
+        close_merchant()
+        if mq.TLO.Window('BigBankWnd').Open() then mq.cmd('/notify BigBankWnd DoneButton leftmouseup'); mq.delay(400) end
+        clear_cursor()
+        -- Wait out the gem's recast before casting. Without this we'd /cast into a refreshing gem,
+        -- nothing would start, and we'd wrongly score it a fizzle. Returns as soon as it's ready.
+        delay(30000, function() return mq.TLO.Me.SpellReady(cfg.spell)() end)
+        if mq.TLO.Me.Sitting() then mq.cmd('/stand'); mq.delay(500) end
+
+        local before = item_count(product)
+        mq.cmdf('/cast %d', gem)
+        -- Give the cast time to BEGIN (or the product to appear, for an instant cast) before judging it.
+        delay(6000, function()
+            return (mq.TLO.Me.Casting.ID() or 0) > 0 or item_count(product) > before
+        end)
+        local cd = mq.gettime() + 15000
+        while mq.gettime() < cd do
+            if (mq.TLO.Me.Casting.ID() or 0) == 0 then break end
+            mq.doevents(); mq.delay(100)
+        end
+        mq.delay(800)
+        close_merchant()
+        clear_cursor()
+        local nowCount = item_count(product)
+        if nowCount > before then
+            printf_log('Made %d %s (%d/%d).', nowCount - before, product, nowCount, wantTotal)
+        else
+            printf_log('Cast yielded no %s - retrying.', product)
+        end
+    end
+    -- The summoned stack tends to accumulate on the cursor rather than auto-stowing. Make a determined
+    -- effort to stow before returning, so it's in bags (counted and deliverable) not stuck on the cursor.
+    for _ = 1, 5 do
+        if (mq.TLO.Cursor.ID() or 0) == 0 then break end
+        mq.delay(600)
+        clear_cursor()
+    end
+    return item_count(product)
+end
+
+-- Make needQty of product: mem the spell, buy each reagent rounded up to a whole cast (need 102 with
+-- perCast 100 -> buy 200), then cast it down. Returns how many we end up holding.
+state.produce_make = function(product, needQty)
+    local cfg = state.PRODUCE[product]
+    if not cfg then printf_log('No producer recipe for %s.', product); return 0 end
+    local have = item_count(product)
+    if have >= needQty then return have end
+
+    local casts  = math.ceil((needQty - have) / cfg.perCast)
+    local buyQty = casts * cfg.perCast
+
+    local gem = state.resolve_gem(cfg)
+    if not state.mem_spell(gem, cfg.spell) then return item_count(product) end
+
+    -- Buy every reagent the recipe consumes; each may live at a different vendor. This uses the
+    -- crafter's own open_merchant/buy_item rather than the listener's copies - they handle the
+    -- stacked-vendor problem in PoK and the under-rendering merchant list, which the old ones did not.
+    for _, r in ipairs(cfg.reagents) do
+        local needReagent = casts * r.per - item_count(r.name)
+        if needReagent > 0 and not r.dropped then
+            local vendors = state.vendorMap and state.vendorMap[r.name]
+            if not vendors or #vendors == 0 then
+                printf_log('No vendor known for %s.', r.name); return item_count(product)
+            end
+            local bought = false
+            for _, v in ipairs(vendors) do
+                local vname = v.name or v
+                if (mq.TLO.Spawn(string.format('npc "%s"', vname)).ID() or 0) > 0 then   -- in this zone
+                    if nav_to(vname) and open_merchant(vname) then
+                        printf_log('Buying %d %s from %s...', needReagent, r.name, vname)
+                        bought = buy_item(r.name, needReagent)
+                        close_merchant()
+                        if bought then break end
+                    end
+                end
+            end
+            if not bought then
+                printf_log('Could not buy %s - no in-zone vendor reachable.', r.name)
+                return item_count(product)
+            end
+        elseif needReagent > 0 and r.dropped then
+            printf_log('%s is dropped/supplied - imbuing the %d on hand (a full batch wants %d).',
+                r.name, item_count(r.name), casts * r.per)
+        end
+    end
+
+    printf_log('Casting %s to make up to %d %s...', cfg.spell, buyQty, product)
+    return state.cast_until(cfg, product, have + buyQty, gem)
+end
+
+-- Drain one queued summon job. Called from the main loop, never from a bind: a /ts_make for 40 units
+-- is minutes of casting with med breaks, and running that inside mq.doevents() would let a second
+-- request re-enter it mid-cast. Queueing is what makes several requests run in order.
+state.drain_make_queue = function()
+    if workerMaking or #workerMakeQueue == 0 then return end
+    local job = table.remove(workerMakeQueue, 1)
+    workerMaking = true
+    mq.cmd('/e3p on')     -- casting, navigating to vendors, cursor work: E3 must not drive the toon
+    printf_log('worker: making %d %s for %s (%d still queued)...', job.qty, job.item, job.sender, #workerMakeQueue)
+    pcall(function() state.produce_make(job.item, job.qty) end)
+    local onHand = item_count(job.item)
+    if onHand <= 0 then
+        printf_log('worker: failed to make any %s.', job.item)
+        state.peer_cmdf(job.sender, '/ts_makefail %s %s', mq.TLO.Me.Name() or '?', job.encoded)
+    else
+        printf_log('worker: finished %s - %d on hand.', job.item, onHand)
+        state.peer_cmdf(job.sender, '/ts_madedone %s %d', job.encoded, onHand)
+    end
+    workerMaking = false
+    -- Hand the toon back only when the whole queue is done, not between jobs.
+    if #workerMakeQueue == 0 then mq.cmd('/e3p off') end
+end
+
+-- CAN THIS CHARACTER MAKE THIS ITEM? The only real test is the spellbook - a class match does not
+-- mean the spell is scribed. Returns the config when we can cast it, nil otherwise.
+state.can_produce = function(item)
+    local cfg = state.PRODUCE[item]
+    if not cfg or not cfg.spell then return nil end
+    if (mq.TLO.Me.Book(cfg.spell)() or 0) == 0 then return nil end
+    return cfg
+end
+
+-- /ts_make handler, shared by BOTH roles. Capability is what decides here, not whether this copy
+-- happens to be headless: an enchanter or cleric running the UI can imbue and summon exactly as well
+-- as a worker can, and refusing on that basis threw away a caster the group actually had. If the
+-- spell is scribed we accept and queue; if it is not, we fail fast WITH OUR NAME so the crafter can
+-- reassign the share to someone who does have it, rather than waiting on us to cast nothing.
+--
+-- Queued, never inline: a batch is minutes of casting with med breaks, and a bind runs inside
+-- mq.doevents(), where the next request would re-enter it mid-cast. The main loop drains the queue,
+-- and on a UI copy it only starts once the local craft job is finished - so accepting a summon can
+-- never pull a busy crafter off its own work, it just lines up behind it.
+state.on_ts_make = function(sender, encoded, qtyStr)
+    if not sender or sender == '' or not encoded then return end
+    local item = namecodec.decode(encoded)
+    local qty  = tonumber(qtyStr) or 0
+    local me   = mq.TLO.Me.Name() or '?'
+    printf_log('/ts_make from %s for %d %s', sender, qty, item)
+    if qty <= 0 then state.peer_cmdf(sender, '/ts_makefail %s %s', me, encoded); return end
+
+    local cfg = state.can_produce(item)
+    if not cfg then
+        local known = state.PRODUCE[item]
+        printf_log('Cannot make %s - %s.', item,
+            known and ('"' .. tostring(known.spell) .. '" is not in my spellbook')
+                  or 'no producer recipe for it')
+        state.peer_cmdf(sender, '/ts_makefail %s %s', me, encoded)
+        return
+    end
+
+    -- Accepted. The crafter stops waiting on this one and queues the next; we report /ts_madedone
+    -- when the casting actually finishes, however long that takes.
+    state.peer_cmdf(sender, '/ts_makestart %s', encoded)
+    workerMakeQueue[#workerMakeQueue + 1] = { item = item, qty = qty, sender = sender, encoded = encoded }
+    if state.busy or state.pendingJob or state.levelRunning then
+        printf_log('Queued make %d %s - will start when the current job finishes [%d in queue].',
+                   qty, item, #workerMakeQueue)
+    else
+        printf_log('Queued make %d %s [%d in queue].', qty, item, #workerMakeQueue)
+    end
+end
+
+-- ONE PLACE THAT DECIDES WHETHER WE CAN TAKE WORK. Every responder asks this first. Returning a
+-- reason (rather than a bare boolean) means the requester's log says WHY it was skipped, and the
+-- reason travels back over /ts_busy so the crafter can distinguish "working" from "hasn't got it".
+state.busy_reason = function()
+    if workerMaking                       then return 'summoning'   end
+    if #workerMakeQueue > 0               then return 'summon-queued' end
+    if (workerBusy or 0) > 0              then return 'delivering'  end
+    if state.busy                         then return 'crafting'    end
+    if state.levelRunning                 then return 'leveling'    end
+    if state.pendingJob                   then return 'job-queued'  end
+    return nil
+end
+
+-- HEADLESS ON A MULE. Nobody is looking at this character, and an ImGui window on six background
+-- clients is both wasted frames and - per the AdventureTime crash work - the one place a yield or a
+-- stray game read can take a client down. A worker draws nothing.
+if LC_WORKER then
+    -- ===== SUPPLY, WORKER SIDE =====
+    -- The two commands that carry a whole resupply: the crafter queues each shortfall with /ts_qadd,
+    -- then fires one /ts_qrun. Everything these need already exists on this side - state.bankTopUp for
+    -- the pull, state.deliver_to_peer for the handover, both proven on the crafter - so this is wiring,
+    -- not new machinery. That is the point of moving them here: one implementation, not two that drift.
+    -- Deliberately mirrors the listener's shape, including the ONE bank trip for the whole batch. The
+    -- expensive part of a resupply is walking to the bank, not the trading.
+    workerBatch = {}      -- global: this chunk is at Lua's 200-local ceiling
+    workerBusy  = 0       -- nesting depth, so an inner job cannot resume E3 out from under an outer one
+
+    -- PAUSE E3 FOR THE WHOLE JOB. Every worker job is nav-heavy and cursor-heavy - walk to the bank,
+    -- withdraw, walk to the crafter, pick stacks up, drop them in a trade window - and a live E3 grabs
+    -- the cursor, re-targets and moves the toon while that is happening. TradeskillListener learned this
+    -- the hard way ("a live E3 also grabs the cursor / re-targets / moves the toon DURING our pickup,
+    -- which broke the 2nd item in a batch") and the crafter already pauses for exactly the same reason
+    -- before every job it runs. The worker was the one path doing this work with E3 still driving.
+    -- /e3p on = paused, /e3p off = E3 active. Counted rather than boolean so overlapping requests do not
+    -- hand the toon back mid-job; the LAST one out resumes.
+    local function worker_pause()
+        workerBusy = workerBusy + 1
+        if workerBusy == 1 then mq.cmd('/e3p on') end
+    end
+    local function worker_resume()
+        workerBusy = math.max(0, workerBusy - 1)
+        if workerBusy == 0 then mq.cmd('/e3p off') end   -- hand the toon back
+    end
+
+    pcall(function() mq.bind('/ts_qadd', function(encoded, mode, qtyStr)
+        if not encoded then return end
+        local item = namecodec.decode(encoded)
+        local qty  = tonumber(qtyStr)
+        workerBatch[#workerBatch + 1] = {
+            name = item,
+            mode = (mode == 'all') and 'all' or 'stack',
+            qty  = (qty and qty > 0) and math.floor(qty) or nil,
+        }
+        printf_log('worker: queued %s (%s%s) [%d total]', item, mode or 'stack',
+            (qty and qty > 0) and (' x' .. math.floor(qty)) or '', #workerBatch)
+    end) end)
+
+    pcall(function() mq.bind('/ts_qrun', function(sender)
+        if not sender then return end
+        local batch = workerBatch
+        workerBatch = {}                     -- clear before running, so a late /ts_qadd starts a new one
+        if #batch == 0 then
+            printf_log('worker: /ts_qrun from %s but nothing queued.', sender)
+            state.peer_cmdf(sender, '/ts_qdone 0')
+            return
+        end
+        local why = state.busy_reason()
+        if why then
+            -- Mid-summon or mid-craft. Say so and hand the batch back rather than starting a second
+            -- job on top of the first - one cursor, one toon. /ts_qdone 0 releases the crafter's wait
+            -- loop immediately; the /ts_busy that precedes it is what stops it concluding we're empty.
+            printf_log('worker: declining /ts_qrun from %s - %s.', sender, why)
+            state.peer_cmdf(sender, '/ts_busy %s %s', mq.TLO.Me.Name() or '?', why)
+            state.peer_cmdf(sender, '/ts_qdone 0')
+            return
+        end
+        printf_log('worker: /ts_qrun from %s - %d item(s) as one batch.', sender, #batch)
+        worker_pause()
+
+        -- Phase 1: ONE bank trip covering every item. bankTopUp early-outs when the bank holds none of
+        -- an item, so listing them all costs nothing for the ones already in bags.
+        for _, b in ipairs(batch) do
+            local target = b.qty and (item_count(b.name) + b.qty) or math.huge
+            pcall(function() state.bankTopUp(b.name, target) end)
+        end
+
+        -- Phase 2: ONE delivery. deliver_to_peer takes the whole list and fills a single trade window,
+        -- 8 slots shared across items, and signals /ts_loaded before confirming.
+        local want = {}
+        for _, b in ipairs(batch) do
+            local q = b.qty or item_count(b.name)
+            if q > 0 then want[#want + 1] = { name = b.name, qty = math.min(q, item_count(b.name)) } end
+        end
+        local total = 0
+        if #want > 0 then
+            local ok, placed = pcall(function() return state.deliver_to_peer(sender, want) end)
+            total = (ok and placed) or 0
+        end
+        printf_log('worker: batch complete - %d unit(s) to %s.', total, sender)
+        worker_resume()
+        state.peer_cmdf(sender, '/ts_qdone %d', total)
+    end) end)
+
+    -- Single-item supply, the path older callers still use (request_supply / ask_listening_char).
+    -- REPLY PROTOCOL COPIED FROM THE LISTENER, not invented: /ts_have when we are about to deliver,
+    -- /ts_done <item> <qty> on success, /ts_none <item> when we have nothing. The crafter's wait loop
+    -- keys off exactly these, and a wrong or missing reply leaves it sitting until its timeout - so the
+    -- encoded name is echoed back verbatim rather than re-encoded, which is what the listener does.
+    pcall(function() mq.bind('/ts_need', function(sender, encoded, recipient, wantStr)
+        if not sender or not encoded then return end
+        local item = namecodec.decode(encoded)
+        local want = tonumber(wantStr)
+        local deliverTo = (recipient and recipient ~= '') and recipient or sender
+        local why = state.busy_reason()
+        if why then
+            printf_log('worker: declining /ts_need for %s from %s - %s.', item, sender, why)
+            state.peer_cmdf(sender, '/ts_busy %s %s %s', mq.TLO.Me.Name() or '?', why, encoded)
+            return
+        end
+        printf_log('worker: /ts_need from %s for %s%s (deliver to %s)', sender,
+                   want and (want .. 'x ') or '', item, deliverTo)
+        worker_pause()
+        if want and want > 0 then
+            pcall(function() state.bankTopUp(item, item_count(item) + want) end)
+        else
+            pcall(function() state.bankTopUp(item, math.huge) end)
+        end
+        local have = item_count(item)
+        if have <= 0 then
+            printf_log('worker: no %s available.', item)
+            worker_resume()
+            state.peer_cmdf(sender, '/ts_none %s', encoded)
+            return
+        end
+        local qty = want and math.min(want, have) or have
+        state.peer_cmdf(sender, '/ts_have %s %d', encoded, qty)
+        local ok, placed = pcall(function() return state.deliver_to_peer(deliverTo, item, qty) end)
+        worker_resume()
+        state.peer_cmdf(sender, '/ts_done %s %d', encoded, (ok and placed) or 0)
+    end) end)
+
+    -- 'all': sweep every stack of one item rather than a counted amount.
+    pcall(function() mq.bind('/ts_need_all', function(sender, encoded)
+        if not sender or not encoded then return end
+        local item = namecodec.decode(encoded)
+        local why = state.busy_reason()
+        if why then
+            printf_log('worker: declining /ts_need_all for %s from %s - %s.', item, sender, why)
+            state.peer_cmdf(sender, '/ts_busy %s %s %s', mq.TLO.Me.Name() or '?', why, encoded)
+            return
+        end
+        printf_log('worker: /ts_need_all from %s for %s', sender, item)
+        worker_pause()
+        pcall(function() state.bankTopUp(item, math.huge) end)
+        local have = item_count(item)
+        if have <= 0 then
+            worker_resume()
+            state.peer_cmdf(sender, '/ts_none %s', encoded)
+            return
+        end
+        state.peer_cmdf(sender, '/ts_have %s %d', encoded, have)
+        local ok, placed = pcall(function() return state.deliver_to_peer(sender, item, have) end)
+        worker_resume()
+        state.peer_cmdf(sender, '/ts_done %s %d', encoded, (ok and placed) or 0)
+    end) end)
+
+    -- ===== PRODUCER, WORKER SIDE =====
+    -- The last thing TradeskillListener could do that this could not. The bind only validates and
+    -- QUEUES; the casting itself happens in the main loop (see state.drain_make_queue) so a second
+    -- request arriving mid-cast lines up behind the first instead of re-entering it.
+    pcall(function() mq.bind('/ts_make', state.on_ts_make) end)
+
+    -- Fast availability check: how many we hold, bags + bank, answered without opening a bank or
+    -- moving. state.bank_count reads a CLOSED bank correctly, which is what makes this sub-second.
+    -- Production uses DanNet for this now; /tsprobe still uses the command, and it costs ~10 lines.
+    pcall(function() mq.bind('/ts_check', function(sender, encoded)
+        if not sender or not encoded then return end
+        state._bankCache = nil   -- only invalidated on bank OPEN, so a post-delivery answer would be stale
+        local item = namecodec.decode(encoded)
+        local bags, bank = item_count(item), (state.bank_count(item) or 0)
+        state.peer_cmdf(sender, '/ts_avail %s %d %s', encoded, bags + bank, mq.TLO.Me.Name() or '?')
+        printf_log('worker: /ts_check from %s for %s -> have %d (bags %d + bank %d)',
+                   sender, item, bags + bank, bags, bank)
+    end) end)
+
+    -- Liveness, so the crafter's ensure_listener() gets its answer from a worker just as it does from
+    -- the listener. Without this a worker looks dead and the crafter waits out its whole fallback.
+    pcall(function() mq.bind('/ts_ping', function(sender)
+        if sender and sender ~= '' then
+            state.peer_cmdf(sender, '/ts_pong %s', mq.TLO.Me.Name() or '')
+        end
+    end) end)
+
+    -- The crafter sends this when it has finished with us. Nothing to tear down - the batch is already
+    -- cleared on run - but acknowledge it so a stale queue cannot survive into the next request.
+    pcall(function() mq.bind('/ts_cancel', function() workerBatch = {} end) end)
+
+    -- The crafter can stop us cleanly rather than leaving a script running on a toon that has wandered
+    -- off. Matches the /ts_close the old worker line used.
+    pcall(function() mq.bind('/ts_close', function()
+        printf_log('worker: /ts_close received - shutting down')
+        -- Hand the toon back before we go. A worker that exits while E3 is paused leaves the character
+        -- frozen with no script left to un-pause it - the listener routes every exit through one place
+        -- for exactly this reason.
+        mq.cmd('/e3p off')
+        state.running = false
+    end) end)
+    printf_log('worker mode: headless, crafter=%s, build %s',
+               (LC_CRAFTER ~= '' and LC_CRAFTER or '(unset)'), state.BUILD_TAG or '?')
+    printf('\ag[Tradeskill]\ax worker mode - headless, serving %s',
+           LC_CRAFTER ~= '' and LC_CRAFTER or 'the group')
+else
+    -- ===== CRAFTER SIDE: DECLINE, DO NOT IGNORE =====
+    -- A UI copy of LazCraft is human-driven and never volunteers as a mule - if three of these are
+    -- running, none of them should walk off mid-craft because a fourth asked for a stack of clay.
+    -- Previously that was achieved by binding nothing at all, which is silent: the asker sat out its
+    -- whole 30-second timeout and then recorded us as not having the item. Answering costs one
+    -- round-trip and tells the truth - we have it, we are busy - so it retries us later instead of
+    -- writing the item off. /ts_ping is answered for the same reason: without it the asker concludes
+    -- this toon is dead and launches a WORKER on top of the copy already running here.
+    local function crafter_decline(sender, encoded)
+        if not sender or sender == '' then return end
+        local why = state.busy_reason() or 'crafter-ui'
+        state.peer_cmdf(sender, '/ts_busy %s %s %s', mq.TLO.Me.Name() or '?', why, encoded or '')
+        printf_log('declined a supply request from %s - %s.', sender, why)
+    end
+    pcall(function() mq.bind('/ts_need',     function(sender, encoded) crafter_decline(sender, encoded) end) end)
+    pcall(function() mq.bind('/ts_need_all', function(sender, encoded) crafter_decline(sender, encoded) end) end)
+    -- SUMMONING IS THE EXCEPTION to "a UI copy never volunteers". Handing over items means walking to
+    -- a bank and off to another character, which is exactly what would wreck a craft in progress.
+    -- Casting does not: it happens standing where we are, and the queue only starts once the local job
+    -- is done. So if this toon is an enchanter or a cleric with the spell scribed, it does the work.
+    -- state.on_ts_make fails it back if the spell is not scribed, so a non-caster still declines fast.
+    pcall(function() mq.bind('/ts_make', state.on_ts_make) end)
+    -- /ts_qadd is harmless to accept (it only builds a list) but pointless if we will refuse the run,
+    -- so drop it on the floor and answer the /ts_qrun that follows.
+    pcall(function() mq.bind('/ts_qrun', function(sender)
+        crafter_decline(sender, nil)
+        if sender and sender ~= '' then state.peer_cmdf(sender, '/ts_qdone 0') end
+    end) end)
+    pcall(function() mq.bind('/ts_ping', function(sender)
+        if sender and sender ~= '' then
+            state.peer_cmdf(sender, '/ts_pong %s', mq.TLO.Me.Name() or '')
+        end
+    end) end)
+
+    mq.imgui.init(scriptName, render_window)
+    printf('\ag[Tradeskill]\ax UI open - \ay/lua run TradeskillSuite\ax or \ay/tsui toggle\ax')
+end
 
 while state.running do
     -- All-tradeskills chain: when the current skill's leveling run has ended on its own (cap / out of
@@ -15878,6 +16753,14 @@ while state.running do
     -- (levelRunning false, nothing busy or queued), never mid-run. A Stop clears levelAllRunning.
     if state.levelAllRunning and not state.levelRunning and not state.busy and not state.pendingJob then
         state.level_all_next()
+    end
+    -- Queued summons run HERE, not in the /ts_make bind. Casting a batch is minutes of work with med
+    -- breaks; doing that inside a bind means it executes during mq.doevents(), where the next incoming
+    -- request would re-enter it mid-cast. Gated on the crafter being idle so a worker that is also
+    -- (somehow) crafting finishes that first.
+    if #workerMakeQueue > 0 and not workerMaking
+       and not state.busy and not state.pendingJob and not state.levelRunning then
+        state.drain_make_queue()
     end
     if state.pendingJob then
         local job = state.pendingJob
@@ -16110,5 +16993,23 @@ while state.running do
 end
 
 pcall(function() mq.unbind('/tsui') end)
+pcall(function() mq.unbind('/lazcraftui') end)
+pcall(function() mq.unbind('/lazlog') end)
 pcall(function() mq.unbind('/tsreq') end)
-mq.imgui.destroy(scriptName)
+pcall(function() mq.unbind('/ts_close') end)
+pcall(function() mq.unbind('/ts_loaded') end)
+pcall(function() mq.unbind('/ts_qadd') end)
+pcall(function() mq.unbind('/ts_qrun') end)
+pcall(function() mq.unbind('/ts_cancel') end)
+pcall(function() mq.unbind('/ts_need_all') end)
+pcall(function() mq.unbind('/ts_need') end)
+pcall(function() mq.unbind('/ts_ping') end)
+pcall(function() mq.unbind('/ts_make') end)
+pcall(function() mq.unbind('/ts_check') end)
+pcall(function() mq.unbind('/ts_busy') end)
+-- Only destroy what we created; a worker never called imgui.init.
+if not LC_WORKER then mq.imgui.destroy(scriptName) end
+-- BACKSTOP: whatever route we exited by - /ts_close, /lua stop, an error - never leave the character
+-- frozen with E3 paused and no script running to release it. Idempotent, so it is safe when E3 is
+-- already active.
+if LC_WORKER then mq.cmd('/e3p off') end

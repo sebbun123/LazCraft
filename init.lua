@@ -222,7 +222,7 @@ local UI = {
 
 local state = {
     VERSION = '1.01',                              -- release version, shown in the title bar
-    BUILD_TAG = 'lc-configver-2026-08-08',            -- release marker (log header + Settings = stale-copy check)
+    BUILD_TAG = 'lc-yieldqty-2026-09-27',            -- release marker (log header + Settings = stale-copy check)
     running = true,
     windowOpen = true,
     wasOpen = true,
@@ -5890,7 +5890,15 @@ local function open_kit(cinfo, kitPack)
         needFreshOpen = true
         state.combineWindowDirty = false
     end
-    if not needFreshOpen and kit_open(cinfo) then return true end
+    -- Reuse an already-open window ONLY if pack<kitPack> actually holds THIS kit. kit_open() is
+    -- window presence alone (any ContainerCombine_Items counts), so a subcombine that left its own
+    -- kit's window up sails straight through here -- skipping the pack-name check below, which is
+    -- the one thing that can tell the two kits apart. That turns "wrong kit seated" from a clear
+    -- error into a silent wrong-container combine failure. One TLO read buys the identity.
+    if not needFreshOpen and kit_open(cinfo)
+       and (mq.TLO.Me.Inventory('pack' .. kitPack).Name() or ''):lower() == (cinfo.name or ''):lower() then
+        return true
+    end
     clear_cursor()
     close_merchant()
     -- Check pack<kitPack> DIRECTLY rather than FindItem (which returns the first match - a
@@ -9842,6 +9850,29 @@ local function run_engine(job)
             -- Inventory top recipe: sub-parts may have left a forge/oven open. Re-open the
             -- kit so the right container is active before the combine loop. open_kit closes
             -- any lingering forge window first, and is a fast no-op if the kit is already up.
+            --
+            -- RE-SEAT THE KIT FIRST. The seat at the top of run_engine ran BEFORE the preflight,
+            -- and a subcombine (make_subcombine -> execute_recipe) swaps pack<kitPack> to ITS OWN
+            -- kit and never puts ours back. So we can arrive here with, say, the Jeweler's Kit in
+            -- pack10 while the top recipe is a Sewing Kit combine -- and every combine then fails
+            -- "cannot combine in this container type" (Variegated Silk, 2026-08-29). This is the
+            -- same hazard the trophy re-seat directly above already handles, one step earlier in
+            -- the pipeline; execute_recipe orders it correctly (subcombines, THEN ensure_kit_in_pack)
+            -- and this is run_engine catching up.
+            --
+            -- Guarded on a name mismatch rather than called unconditionally: kitPack may have been
+            -- re-pointed by cinfo.pack above (a non-configured kit found in another slot), and in
+            -- that case the kit is already where it belongs and a blind re-seat would fight it.
+            local wantKit  = recSec.Container or ''
+            local havePack = mq.TLO.Me.Inventory('pack' .. kitPack).Name() or ''
+            if wantKit ~= '' and havePack:lower() ~= wantKit:lower() then
+                printf_log('pack%d holds "%s" but %s needs "%s" (a subcombine swapped it) - re-seating.',
+                    kitPack, havePack ~= '' and havePack or 'nothing', rec.name, wantKit)
+                if not ensure_kit_in_pack(wantKit, kitPack) then
+                    printf_log('ERROR: could not seat %s in pack%d - stopping %s.', wantKit, kitPack, rec.name)
+                    return
+                end
+            end
             if not open_kit(cinfo, kitPack) then return end
         end
 
@@ -10080,12 +10111,31 @@ local function run_engine(job)
                             -- misconfigured, so abort instead of looping forever.
                             wrongContainerStrikes = wrongContainerStrikes + 1
                             clear_kit(cinfo, kitPack, slotCount)
-                            if wrongContainerStrikes >= 2 then
-                                printf_log('ABORT %s: "cannot combine in this container type" persisted after a fresh re-stage - check the recipe/container.', rec.name)
+                            -- Before blaming the INI: the commonest cause of this message is not a bad
+                            -- recipe, it's the RIGHT ingredients staged into the WRONG kit. Check what
+                            -- pack<kitPack> is actually holding and re-seat if it isn't ours, so the
+                            -- retry is a different attempt rather than the same mistake twice. A
+                            -- re-seat clears the strike count: the cause is fixed, so it wasn't a real
+                            -- strike against the recipe.
+                            local wantKit  = recSec.Container or ''
+                            local havePack = mq.TLO.Me.Inventory('pack' .. kitPack).Name() or ''
+                            if wantKit ~= '' and havePack:lower() ~= wantKit:lower() then
+                                printf_log('Wrong kit for %s: pack%d holds "%s", need "%s" - re-seating and retrying.',
+                                    rec.name, kitPack, havePack ~= '' and havePack or 'nothing', wantKit)
+                                if ensure_kit_in_pack(wantKit, kitPack) and open_kit(cinfo, kitPack) then
+                                    wrongContainerStrikes = 0
+                                end
+                                failedTotal = failedTotal + 1
+                            elseif wrongContainerStrikes >= 2 then
+                                -- Genuinely the recipe/container now: the right kit IS seated and it
+                                -- still won't take the combine. Name both so the report is actionable.
+                                printf_log('ABORT %s: "cannot combine in this container type" persisted after a fresh re-stage (pack%d holds "%s", recipe wants "%s") - check the recipe/container.',
+                                    rec.name, kitPack, havePack ~= '' and havePack or 'nothing', wantKit ~= '' and wantKit or '?')
                                 break
+                            else
+                                printf_log('Wrong container contents for %s - cleared, re-staging fresh and retrying once.', rec.name)
+                                failedTotal = failedTotal + 1
                             end
-                            printf_log('Wrong container contents for %s - cleared, re-staging fresh and retrying once.', rec.name)
-                            failedTotal = failedTotal + 1
                         else
                             -- normal fizzle: ingredients were returned to the kit off the cursor - reuse next pass
                             wrongContainerStrikes = 0
@@ -10120,6 +10170,21 @@ local function run_engine(job)
                                     if mq.TLO.Window('ContainerCombine_Items').Open() then
                                         printf_log('ERROR: slot 10 would not close (still open) - aborting %s.', rec.name)
                                         break
+                                    end
+                                    -- Re-seat before reopening. This reset is where a stale pack10
+                                    -- finally surfaces (open_kit prints 'must be in packN - pack10
+                                    -- currently holds X') and the old code only reported it, then gave
+                                    -- up. ensure_kit_in_pack is right here and fixes exactly that: a
+                                    -- no-op when the kit is already seated, a repair when it isn't, so
+                                    -- the run heals instead of aborting.
+                                    do
+                                        local wantKit  = recSec.Container or ''
+                                        local havePack = mq.TLO.Me.Inventory('pack' .. kitPack).Name() or ''
+                                        if wantKit ~= '' and havePack:lower() ~= wantKit:lower() then
+                                            printf_log('pack%d holds "%s", %s needs "%s" - re-seating during reset.',
+                                                kitPack, havePack ~= '' and havePack or 'nothing', rec.name, wantKit)
+                                            ensure_kit_in_pack(wantKit, kitPack)
+                                        end
                                     end
                                     if not open_kit(cinfo, kitPack) then
                                         printf_log('ERROR: could not reopen slot 10 after reset - aborting %s.', rec.name)
@@ -12414,10 +12479,24 @@ state.run_fish_engine = function(job)
 
     -- config / tunables
     local FISH_TROPHY     = 'Bounty of the Master Baiter'   -- equipped while fishing; right-click summons gear
-    local hasTrophy       = item_count(FISH_TROPHY) >= 1
+    local stayPut         = (job.spot == 'here')   -- Just Fish: never travel/bank/shop
+    -- Find the trophy anywhere on us (bags OR any worn slot) - item_count is bags-only and missed it
+    -- once it sat in ammo. A BANKED trophy (Bank all Trophies sweeps it) counts for the travelling
+    -- buttons (equip_modifier pulls it from the bank), but not for Just Fish, which never moves.
+    local function count_q(tlo) local okc, n = pcall(function() return tlo('=' .. FISH_TROPHY)() end); return (okc and tonumber(n)) or 0 end
+    local trophyOnMe      = count_q(mq.TLO.FindItemCount) > 0
+    local trophyInBank    = count_q(mq.TLO.FindItemBankCount) > 0
+    local hasTrophy       = trophyOnMe or (trophyInBank and not stayPut)
     -- With the trophy we summon Master gear (no vendor). Without it, fall back to the vendor pole/bait.
     local FISH_POLE       = hasTrophy and "Master Baiter's Rod" or 'Fishing Pole'
     local FISH_BAIT       = hasTrophy and 'Master Bait'        or 'Fishing Bait'
+    if stayPut and not hasTrophy then
+        -- Just Fish without the trophy: use whichever gear you're actually carrying (leftover Master
+        -- rod/bait work fine - they just can't be re-summoned).
+        local rod = "Master Baiter's Rod"
+        if item_count(rod) > 0 or (mq.TLO.Me.Inventory('mainhand').Name() or '') == rod then FISH_POLE = rod end
+        if item_count('Master Bait') > 0 then FISH_BAIT = 'Master Bait' end
+    end
     local FISH_VENDOR     = 'Daeld Atand'         -- pole + bait live in PoK (fallback path only)
     local FISH_BAIT_STACK = 1000
     local BAIT_CAP        = 1000      -- summoned Master Bait over this is DESTROYED, not bagged
@@ -12470,8 +12549,10 @@ state.run_fish_engine = function(job)
             label = 'Hardcore Qeynos Hills (Shard)', travel = state.travel_to_hardcore_qeynos,
             loc = { y = 4786, x = 672.42, z = -22.42 }, heading = 183.74, skillCap = nil, poleStock = 5,
         },
-        here = {   -- the plain "Fish" button: fish wherever you're standing, no travel, no target
+        here = {   -- the "Just Fish" button: fish wherever you're standing. NEVER travels, navs or shops -
+                   -- missing gear (and no trophy to summon it) is an error, not a trip to PoK.
             label = 'the current spot', travel = nil, loc = nil, heading = nil, skillCap = nil, poleStock = 1,
+            stayPut = true,
         },
     }
     local spot        = FISH_SPOTS[job.spot] or FISH_SPOTS.pok
@@ -12567,13 +12648,31 @@ state.run_fish_engine = function(job)
                 delay(500, function() return cursor_id() == 0 end)
             end
         end
-        return item_count(FISH_POLE) >= 1
+        -- Judge success by what was ASKED for. item_count is bags-only, so the rod we're already
+        -- wielding counts as 0 - a bait-only resupply (needPole=false) used to return false here
+        -- and kill the run with "bait resupply failed" the first time bait ran out.
+        if needPole and item_count(FISH_POLE) < 1 and not pole_in_slot() then return false end
+        if baitMin > 0 and item_count(FISH_BAIT) < 1 then return false end
+        return true
     end
 
     -- Unified supply: summon from the trophy if we have it (no vendor trip, no travel), otherwise
     -- fall back to the PoK vendor buy.
     local function supply(needPole, baitTarget)
         if hasTrophy then return summon_supply(needPole, baitTarget) end
+        if spot.stayPut then
+            -- Just Fish: no vendor trips. Use what's on hand or stop with a clear reason.
+            if needPole and item_count(FISH_POLE) < 1 and not pole_in_slot() then
+                if trophyInBank then
+                    error(FISH_TROPHY .. ' is in your BANK (Bank all Trophies?) - put it in your bags so Just Fish can summon a rod')
+                end
+                error('no ' .. FISH_POLE .. ' on you (Just Fish never travels to buy one)')
+            end
+            if (baitTarget or 0) > 0 and item_count(FISH_BAIT) < 1 then
+                error('out of ' .. FISH_BAIT .. ' (Just Fish never travels to buy more)')
+            end
+            return true
+        end
         return resupply(needPole and 1 or 0, baitTarget)
     end
 
@@ -12620,7 +12719,7 @@ state.run_fish_engine = function(job)
 
         -- Initial supply: rod + a full stack of bait. With the trophy this summons (instant, no
         -- travel); otherwise it's the PoK vendor buy, topping up only when actually low.
-        if not supply(true, hasTrophy and BAIT_CAP or BAIT_START_MIN) then
+        if not supply(true, hasTrophy and BAIT_CAP or (spot.stayPut and 1 or BAIT_START_MIN)) then
             error(hasTrophy and ('could not summon a ' .. FISH_POLE .. ' from ' .. FISH_TROPHY) or ('could not buy pole/bait from ' .. FISH_VENDOR))
         end
         check_stop()
@@ -12634,6 +12733,7 @@ state.run_fish_engine = function(job)
             printf_log('Fishing: skill %d (trophy mode - runs until bags fill or you stop). Casting with "%s".', startSkill, FISH_CAST_CMD)
         end
 
+        local gearFails = 0   -- consecutive pole/bait complaints from the game (recoverable up to 3)
         while true do
             check_stop()
 
@@ -12687,11 +12787,29 @@ state.run_fish_engine = function(job)
             mq.cmd(FISH_CAST_CMD)
             delay(FISH_CAST_WAIT, function() return cursor_id() ~= 0 or state.fishFail ~= nil end)
             mq.doevents()
-            -- The game told us why this cast can't work: stop instead of casting into nothing for
-            -- hours. Dry land means the nav never got us to the water.
+            -- The game told us why this cast can't work. Dry land is fatal (nav never got us to the
+            -- water). Pole/bait complaints are NOT: the rod breaks mid-cast after a long run, and that
+            -- used to kill the whole run ("pole is not in the primary hand"). Loop back - the checks
+            -- at the top re-summon/re-equip - and only give up if it keeps happening.
             if state.fishFail then
-                error('cannot fish here - ' .. tostring(state.fishFail))
+                local why = tostring(state.fishFail)
+                if why:find('dry land', 1, true) then error('cannot fish here - ' .. why) end
+                gearFails = gearFails + 1
+                if gearFails >= 4 then error('cannot fish - ' .. why .. ' (still failing after re-equipping)') end
+                printf_log('Fishing: %s - re-checking gear (%d/3)...', why, gearFails)
+                state.fishFail = nil
+                if cursor_id() ~= 0 then clear_cursor() end
+                -- Pole still reads as equipped but the game disagrees: pull it off so the top of
+                -- the loop re-seats it cleanly.
+                if why:find('pole', 1, true) and pole_in_slot() then
+                    mq.cmd('/itemnotify mainhand leftmouseup')
+                    delay(700, function() return cursor_id() ~= 0 end)
+                    if cursor_id() ~= 0 then mq.cmd('/autoinventory'); delay(700, function() return cursor_id() == 0 end) end
+                end
+                delay(1000)
+                goto continue
             end
+            gearFails = 0
             if cursor_id() ~= 0 then
                 local caught = mq.TLO.Cursor.Name() or ''
                 local lists = state.fishLists or { destroy = {}, keep = {} }
@@ -12720,6 +12838,7 @@ state.run_fish_engine = function(job)
                     printf_log('Fishing: caught %s (%d/%d in bags).', caught, item_count(targetFish), targetQty)
                 end
             end
+            ::continue::
         end
 
         printf_log('Fishing: finished. Skill %d -> %d.', startSkill, skill_value('Fishing') or 0)
@@ -12913,7 +13032,7 @@ local function draw_recipe_preview(rec, qty)
         ImGui.TextDisabled('No recipe data for this item.')
         return
     end
-    ImGui.Text(string.format('Yield per combine: %d', rec.yield))
+    ImGui.Text(string.format('Yield per combine: %d  |  Combines: %d  |  Makes: %d', rec.yield, qty, qty * rec.yield))
     if ImGui.BeginTable('##ts_ing', 3, (ImGuiTableFlags.Borders or 0) + (ImGuiTableFlags.RowBg or 0), 0, 0) then
         ImGui.TableSetupColumn('Ingredient', ImGuiTableColumnFlags.WidthStretch)
         ImGui.TableSetupColumn('Per Combine', ImGuiTableColumnFlags.WidthFixed, 90)
@@ -12983,6 +13102,11 @@ end
 
 -- Resolves the currently selected skill/item/recipe/quantity from the UI.
 -- Returns nil plus logs an error if anything required is missing.
+state.combines_for = function(rec, items)
+    local y = math.max(1, (rec and rec.yield) or 1)
+    return math.max(1, math.ceil((items or 1) / y))
+end
+
 local function resolve_current_selection()
     local skillName = current_skill_name()
     local skillSec = current_skill_section()
@@ -12998,13 +13122,16 @@ local function resolve_current_selection()
         printf_log('ERROR: no recipe data found for %s.', tostring(itemName))
         return nil
     end
-    return skillSec, rec, qty
+    return skillSec, rec, state.combines_for(rec, qty), qty
 end
 
 local function run_start()
     if state.busy then return end
-    local skillSec, rec, qty = resolve_current_selection()
+    local skillSec, rec, qty, items = resolve_current_selection()
     if not skillSec then return end
+    if (rec.yield or 1) > 1 then
+        printf_log('%d %s ordered (yield %d) - %d combine(s), makes %d.', items, rec.name, rec.yield, qty, qty * rec.yield)
+    end
 
     local job = {
         action = 'craft',
@@ -13022,7 +13149,7 @@ local function run_start()
 end
 
 local function queue_add()
-    local skillSec, rec, qty = resolve_current_selection()
+    local skillSec, rec, qty, items = resolve_current_selection()
     if not skillSec or not rec then return end
     -- Store the recipe's REAL skill name. For normal activities that's the selected skill;
     -- for Radix it's resolved from the recipe's container (queue_start rebuilds from this).
@@ -13038,6 +13165,7 @@ local function queue_add()
         skillName  = realSkill,
         itemName   = rec.name,
         qty        = qty,
+        ordered    = items,
         disposal   = state.disposalMode,
         stopOnTrivial = false,   -- Craft always makes the full quantity; leveling owns stopping
     }
@@ -13621,13 +13749,16 @@ local function render_window()
                     if state.craftActivityFishing then
                         if not state.fishLists then state.loadFishLists() end
                         if not state.fishTrophyQty then state.fishTrophyQty = {} end
-                        ImGui.TextColored(0.8, 0.8, 0.3, 1.0, 'Trophy fishing')
-                        ImGui.SameLine()
-                        state.help_marker('With Bounty of the Master Baiter, can summon poles and bait. If none, will travel to vendor, purchase bait and 5 poles, and loop until you have caught the desired quantity. Recommend getting the trophy!')
-                        ImGui.Spacing()
-                        if themed_button('Fish##ts_fish_here', UI.green, 190, UI.btn_h, state.busy) then
+                        if themed_button('Just Fish##ts_fish_here', UI.green, 190, UI.btn_h, state.busy) then
                             state.pendingJob = { action = 'fish', spot = 'here' }
                         end
+                        ImGui.SameLine()
+                        state.help_marker('Fishes right where you stand until you press Stop or bags fill. Never moves, travels or shops. Uses the pole/bait you have (or summons them if you carry Bounty of the Master Baiter). Stops with an error if you are not near water or run out of gear.')
+                        ImGui.Spacing()
+                        ImGui.Separator()
+                        ImGui.TextColored(0.8, 0.8, 0.3, 1.0, 'Trophy fishing (travels)')
+                        ImGui.SameLine()
+                        state.help_marker('With Bounty of the Master Baiter, can summon poles and bait. If none, will travel to vendor, purchase bait and 5 poles, and loop until you have caught the desired quantity. Recommend getting the trophy!')
                         ImGui.Spacing()
                         -- One button per trophy target. Add fish here as you unlock them:
                         -- { label = button text, fish = exact item name, spot = a FISH_SPOTS key }.
@@ -13960,7 +14091,7 @@ local function render_window()
 
                     -- Recipe preview
                     local rec = get_recipe(current_item_name())
-                    local qty = math.max(1, math.min(MAX_QUANTITY, tonumber(state.quantityBuf) or 1))
+                    local qty = state.combines_for(rec, math.max(1, math.min(MAX_QUANTITY, tonumber(state.quantityBuf) or 1)))
                     draw_recipe_preview(rec, qty)
 
                     -- Radix: per-recipe farmed-mat requests, right on the crafter. Each dropped mat this
@@ -14030,8 +14161,8 @@ local function render_window()
                     end
                     ImGui.SameLine()
                     if themed_button('Pre-load mats##ts_craft_preload', UI.amber, 150, UI.btn_h, state.busy) then
-                        local q  = math.max(1, math.min(MAX_QUANTITY, tonumber(state.quantityBuf) or 1))
                         local nm = current_item_name()
+                        local q  = state.combines_for(get_recipe(nm), math.max(1, math.min(MAX_QUANTITY, tonumber(state.quantityBuf) or 1)))
                         if not get_recipe(nm) then
                             printf_log('No recipe data for %s.', tostring(nm))
                         else
@@ -14116,7 +14247,7 @@ local function render_window()
                             local dispStr = entry.disposal == DISPOSAL.SELL and 'Sell' or
                                             entry.disposal == DISPOSAL.DESTROY and 'Destroy' or 'Keep'
                             local stopStr = entry.stopOnTrivial and ' [stop@triv]' or ''
-                            ImGui.Text(string.format('%dx %s  [%s]%s', entry.qty, entry.itemName, dispStr, stopStr))
+                            ImGui.Text(string.format('%dx %s  [%s]%s', entry.ordered or entry.qty, entry.itemName, dispStr, stopStr))
                             if not state.busy then
                                 ImGui.SameLine()
                                 if ImGui.Button('Up##q_up_' .. i) then queue_move_up(i) end
@@ -16871,7 +17002,7 @@ while state.running do
                     local skillSec = (state.iniSections or {})['Skill:' .. (entry.skillName or '')]
                     local rec = get_recipe(entry.itemName)
                     if skillSec and rec then
-                        printf_log('Queue: starting %d/%d - %dx %s', state.currentQueueIndex, #state.queue, entry.qty, entry.itemName)
+                        printf_log('Queue: starting %d/%d - %dx %s', state.currentQueueIndex, #state.queue, entry.ordered or entry.qty, entry.itemName)
                         state.pendingJob = {
                             action = 'craft',
                             skillSection = skillSec,

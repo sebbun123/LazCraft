@@ -25,12 +25,8 @@ function Snapshot.new(deps)
 end
 
 function Snapshot:hear(line)
-    line = tostring(line or '')
-    -- a snapshot's own lines come back through this catch-all (printed indented after the [LC] tag); kept, every
-    -- later snapshot carried all the earlier ones inside it (1.10.0 Vadar log: "-0.5s [LC] -6.4s [LC] -7.1s [LC] ...")
-    if line:find('^%[LC%]%s%s+') then return end
     local c = self.chat
-    c[#c + 1] = { at = self.mq.gettime and self.mq.gettime() or 0, line = line }
+    c[#c + 1] = { at = self.mq.gettime and self.mq.gettime() or 0, line = tostring(line or '') }
     while #c > Snapshot.KEEP do table.remove(c, 1) end
 end
 

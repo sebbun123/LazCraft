@@ -2534,7 +2534,7 @@ test('in game: salvage that lands after the combine is over, at any moment, is s
     local lateSeen = false
     -- with an item pace, the pickups take time, so a late landing can fall between combines or inside a pickup
     -- up to Combine.SALVAGE_MS the combine itself waits for it; later ones land between combines or inside a pickup
-    for _, ms in ipairs({ 20, 70, 120, 270, 470, 700, 1000, 1200 }) do
+    for _, ms in ipairs({ 20, 70, 120, 170, 220, 270, 400, 470, 540 }) do
         local F, G, done = marr(function(G)
             local sf = io.open(ROOT .. 'settings/LazCraft_Glanen.ini', 'w'); sf:write('[Settings]\nClickPace=fixed\nClickFloorMs=0\nQuietMs=0\nItemPaceMs=100\n'); sf:close()
             G:put(1, 1, 'Small Piece of Ore', 4); G:put(1, 2, 'Water Flask', 2)
@@ -2552,7 +2552,7 @@ test('in game: salvage that lands after the combine is over, at any moment, is s
         eq(G:count('Metal Bits'), 2); eq(#G.cursor, 0, ms .. 'ms: cursor empty')
         local late = printed:find('Small Piece of Ore x1 arrived on the cursor after the last combine was over', 1, true)
         if late then lateSeen = true end
-        if ms <= 700 then truthy(not late, ms .. 'ms: waited for inside the combine (SALVAGE_MS 800, 1.10.1)') end
+        if ms <= 270 then truthy(not late, ms .. 'ms: waited for inside the combine') end
         truthy(not printed:find('Pickup failed', 1, true), ms .. 'ms: ' .. printed)
         done()
     end
@@ -2563,7 +2563,7 @@ test('in game: salvage landing while the next combine is placed empties the cont
     local F, G, done = marr(function(G)
         local sf = io.open(ROOT .. 'settings/LazCraft_Glanen.ini', 'w'); sf:write('[Settings]\nClickPace=fixed\nClickFloorMs=0\nQuietMs=0\nItemPaceMs=100\n'); sf:close()
         G:put(1, 1, 'Small Piece of Ore', 4); G:put(1, 2, 'Water Flask', 2)
-        G.combineFails = 1; G.salvage = { ['Metal Bits'] = { 'Small Piece of Ore' } }; G.salvageLateMs = 1100; G.salvageHeld = true   -- past the 800ms watch (1.10.1)
+        G.combineFails = 1; G.salvage = { ['Metal Bits'] = { 'Small Piece of Ore' } }; G.salvageLateMs = 450; G.salvageHeld = true
     end)
     F.at(100, function() F.mq.cmd('/lc make 2 Metal Bits') end)
     F.at(400, function() F.click('Go') end)
@@ -2621,17 +2621,6 @@ test('in game: the game\'s desync lines are waited out, the container emptied an
     truthy(line:find('Metal Bits: 1/2 ok, 1 failed, made 2', 1, true), line)
     eq(G:count('Small Piece of Ore'), 1); eq(#G.cursor, 0)
     done()
-end)
-
-test('snapshot: its own indented lines heard back in chat are not kept (1.10.0 Vadar log: snapshots nested ever deeper)', function()
-    local Snapshot = require('core.snapshot')
-    local s = Snapshot.new({ mq = { gettime = function() return 0 end } })
-    s:hear('You cannot combine these items in this container type!')
-    s:hear('[LC] Forge open (click + Experiment)')
-    s:hear('[LC]   where: poknowledge at 757, -344, -92')
-    s:hear('[LC]     -7.1s [LC] Forge: clearing, /cleanup and opening it again before the next combine')
-    eq(#s.chat, 2, 'the game line and the normal [LC] line only')
-    eq(s.chat[2].line, '[LC] Forge open (click + Experiment)')
 end)
 
 test('datacache: round trip keeps values, shared tables, a self-reference, big tables and holes; a changed file parses again', function()

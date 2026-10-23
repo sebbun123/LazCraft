@@ -21,8 +21,7 @@
 --     the tools and the FailBack ingredients (given back on a failure, used up on a success). The combine
 --     is over once those are in the bags, waited for as a condition and capped at ARRIVE_MS. Anything that
 --     never arrives is logged and reported as missing; nothing waits past the cap.
---   * After a failure the cursor must stay empty SALVAGE_MS (each arrival starts it again, FAIL_CAP_MS in all):
---     salvage and bounced returns come seconds late on Lazarus, and one landing mid-placement desyncs.
+--   * After a failure the cursor is watched SALVAGE_MS longer for salvage that comes after the rest.
 --   * What came back is named in the log: product, tool, salvage (an ingredient returned by a failure) or
 --     other. Salvage cannot be expected (it is chance), so it is not waited for; one that arrives after the
 --     combine is over is stowed by the next pickup.
@@ -38,12 +37,7 @@ Combine.MS = 5000         -- the server answers a combine within this
 Combine.RESEND_MS = 1500  -- no answer by now and nothing moved: the combine was lost; send it again
 Combine.SENDS = 3
 Combine.ARRIVE_MS = 3000  -- what a combine hands back arrives within this
--- after a failure the cursor must stay empty this long before the combine is over; each arrival starts it again,
--- up to FAIL_CAP_MS in all (1.10.1, was 300: the 2.46.8 and 1.10.0 Vadar logs - a failed Cobalt Plate Gorget
--- Template's Toluene Coal came 0.55s after the message and its Plate Gorget Template Mold at 1.1, 1.7 and 2.0s, the
--- server bouncing it back - each landing while the next combine was placed, then a desync. A success waits nothing)
-Combine.SALVAGE_MS = 800
-Combine.FAIL_CAP_MS = 4000
+Combine.SALVAGE_MS = 300  -- after a failure, more salvage can come this long after the rest (48-115ms seen)
 
 local RESULTS = {
     { key = 'success', pattern = 'You have fashioned the items together#*#' },
@@ -216,9 +210,7 @@ function Combine:run(ctx, cmd, want, opts)
             -- refused that combine with a slot empty). So after a failure the cursor is watched SALVAGE_MS more.
             if heard.result ~= 'failed' or salvageWatched then break end
             salvageWatched = true
-            local capLeft = Combine.FAIL_CAP_MS - (self.mq.gettime() - t0)
-            if capLeft <= 0 then break end
-            local s = ctx:wait(math.min(Combine.SALVAGE_MS, capLeft), function() return self.cursor:item() ~= nil end)
+            local s = ctx:wait(Combine.SALVAGE_MS, function() return self.cursor:item() ~= nil end)
             if not s.ok and s.why ~= 'timeout' then return s end
             if not s.ok then break end
             self.log.debug('  more salvage on the cursor %dms after the rest', s.ms or 0)

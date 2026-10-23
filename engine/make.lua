@@ -82,12 +82,6 @@ Make.LATE_RESTARTS = 3  -- a placement where something landed late or an item wo
 Make.REFUSED_TRIES = 3  -- a combine the game refused although everything showed placed: /cleanup, reopened, cleared,
                         -- placed again - twice (2.43.4)
 Make.CLEANUP_MS = 2000  -- /cleanup closes every window within this
-Make.REOPEN_WAITS = { 2000, 5000 }  -- after /cleanup, the station we stand at is clicked again after these (1.10.1)
--- station spots that refused a recipe twice with everything placed: left out for the rest of the session (1.10.1)
-Make.refusing = {}
-local function spot_key(container, st)
-    return string.format('%s|%s|%.0f|%.0f', container, (st.zone or ''):lower(), st.y or 0, st.x or 0)
-end
 Make.WORKER_START_MS = 30000   -- supply: a holder started as our worker sends its card within this
 Make.SUPPLIER_TRIES = 3        -- supply: holders that do not start are left out and the plan made again, this many times
 
@@ -269,16 +263,9 @@ function Make.job(env, recipe, combines, hooks)
     local function try_here(ctx, container, target)
         local def = env.cfg.containers[container]
         local zone = B.travel:zone()
-        local spots, listed = {}, 0
+        local spots = {}
         for _, st in ipairs(def and def.stations or {}) do
-            if lower(st.zone) == zone then
-                listed = listed + 1
-                if not Make.refusing[spot_key(container, st)] then spots[#spots + 1] = st end
-            end
-        end
-        -- every listed one here refused this session: not "the nearest by name" (that finds the same one again)
-        if #spots == 0 and listed > 0 then
-            return R.fail('busy here', string.format('every %s listed in %s refused this session', container, zone))
+            if lower(st.zone) == zone then spots[#spots + 1] = st end
         end
         if #spots == 0 then
             -- none listed here: the nearest by name
@@ -972,10 +959,7 @@ function Make.job(env, recipe, combines, hooks)
         -- rule: after a desync, /cleanup before combining again. 2.46.7 log: a desync on the kit's own slots (5813)
         -- closed its Pack10 window while the combine window stayed up; the recovery only cleared and placed again, and
         -- every /combine pack10 after got "Window 'pack10' not open" - three sends, then "no answer", twice.
-        -- opts.otherStation: the station itself is what is wrong (it refuses this recipe) - no retry of the same one
-        local function reset_container(ctx, opts)
-            opts = opts or {}
-            local prev = open
+        local function reset_container(ctx)
             log.info('%s: clearing, /cleanup and opening it again before the next combine', r.container)
             if (B.cursor.desyncs or 0) ~= seenDesyncs then
                 local s = B.cursor:settle(ctx)
@@ -993,46 +977,8 @@ function Make.job(env, recipe, combines, hooks)
             if not w.ok and w.why ~= 'timeout' then return w end
             log.debug('  /cleanup: combine window %s after %dms', (B.kit:is_open() or B.station:is_open()) and 'still open' or 'closed', w.ms or 0)
             open = {}
-            -- THE SAME STATION, AGAIN (1.10.1): clicked straight after /cleanup a world station did not answer (2.46.8
-            -- and 1.10.0 Vadar logs, a PoK and a Freeport Forge: three clicks, 3s each, nothing) and the run left it as
-            -- "busy" - for the AFK mirror, or a container that refuses the recipe. The same Forge opened on the first
-            -- click once a new run came along. So the station we stand at gets a pause first, then a longer one.
-            -- The user's question, and the log agrees: the SERVER still had something on its cursor. 1.10.0 Vadar log:
-            -- /cleanup at 172.522, the Forge clicked at 172.670, and 0.25s later "Source slot 33 resyncronized.
-            -- Destination slot 4417" - the bounced Plate Gorget Template Mold went from the server's cursor into pack3
-            -- slot 8 after the click; the client's cursor read empty all along. A world container does not open for a
-            -- click with something on the cursor. So before each click: /autoinventory (nothing happens if the server's
-            -- cursor is empty too), then the resync lines it sets off are waited out.
-            local reopened = false
-            if prev.kind == 'station' and not opts.otherStation then
-                for attempt = 1, #Make.REOPEN_WAITS do
-                    log.debug('  send: /autoinventory (whatever the server may still hold on the cursor)')
-                    mq.cmd('/autoinventory')
-                    local p = ctx:pace(Make.REOPEN_WAITS[attempt])
-                    if not p.ok then return p end
-                    local s = B.cursor:settle(ctx)
-                    if not s.ok then return s end
-                    seenDesyncs = B.cursor.desyncs or seenDesyncs
-                    local st2 = B.cursor:stow(ctx)   -- anything the resync put back on the cursor
-                    if not st2.ok then return st2 end
-                    local o = B.station:open(ctx, prev.target)
-                    if o.ok then
-                        open = { kind = 'station', name = prev.name, target = prev.target }
-                        opened[prev.name] = true
-                        log.info('%s open again after /cleanup (%.1fs wait%s)', r.container, Make.REOPEN_WAITS[attempt] / 1000,
-                            attempt > 1 and string.format(', try %d', attempt) or '')
-                        reopened = true
-                        break
-                    end
-                    if o.why == 'stopped' then return o end
-                    log.info('%s did not open %.1fs after /cleanup (%s)%s', r.container, Make.REOPEN_WAITS[attempt] / 1000,
-                        R.describe(o), attempt < #Make.REOPEN_WAITS and ' - waiting longer' or ' - trying the others')
-                end
-            end
-            if not reopened then
-                local u3 = use_container(ctx, r.container)
-                if not u3.ok then return u3 end
-            end
+            local u3 = use_container(ctx, r.container)
+            if not u3.ok then return u3 end
             local left = contents()
             if left ~= 'empty' then
                 log.info('%s open again; it still holds %s - taking it out', r.container, left)
@@ -1082,7 +1028,6 @@ function Make.job(env, recipe, combines, hooks)
                 end
             end
             local again, tries, lates = true, 0, 0
-            local refusedSpot   -- the station spot the last refusal of this combine came at (1.10.1)
             local guarded = false
             troubled = false
             while again do
@@ -1226,28 +1171,12 @@ function Make.job(env, recipe, combines, hooks)
                         -- out, and it is placed again
                         tries = tries + 1
                         if env.snapshot then env.snapshot:dump(string.format('%s %d/%d refused: %s', r.label, n, step.combines, c.value.line)) end
-                        -- A STATION THAT DOES NOT TAKE THE RECIPE (1.10.1; 1.10.0 Vadar log: a PoK "Forge", IT10804, refused
-                        -- 9 of 9 with everything placed while the IT66 one made them): refused again at the same spot
-                        -- after the full reset, it is left out for the session and the reset goes to another one
-                        local otherStation = false
-                        if c.value.result == 'refused' and open.kind == 'station' then
-                            local spot = lastGood[r.container]
-                            if spot and refusedSpot == spot then
-                                Make.refusing[spot_key(r.container, spot)] = true
-                                lastGood[r.container] = nil
-                                log.warn('%s at %.0f, %.0f refused %s twice with everything placed - it does not take this recipe; left out this session, trying another',
-                                    r.container, spot.y, spot.x, r.label)
-                                tries, refusedSpot, otherStation = 0, nil, true
-                            else
-                                refusedSpot = spot
-                            end
-                        end
                         if tries < Make.REFUSED_TRIES then
                             log.warn('%s %d/%d: the game %s; the container now shows %s - clearing it, /cleanup, opening it again',
                                 r.label, n, step.combines,
                                 c.value.result == 'closed' and ('had no window for it (' .. c.value.line .. ')') or ('refused it (' .. c.value.line .. ')'),
                                 contents())
-                            local rs = reset_container(ctx, { otherStation = otherStation })
+                            local rs = reset_container(ctx)
                             if not rs.ok then entry.stopped = R.describe(rs); return rs end
                             again = true
                         else

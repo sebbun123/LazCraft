@@ -1,51 +1,36 @@
 # LazCraft
 
-*All things LazCraft*
+Tradeskill automation for EverQuest Project Lazarus, as a MacroQuest Lua script. It plans a craft from the
+recipe data (what you have, what to buy and where, what to make first), travels, banks, shops, and makes it -
+at kits and world stations - and can use your other characters as workers that bring, buy or summon what a
+recipe needs.
 
-Welcome to the GitHub for LazCraft. Download the current version, report bugs, and let me know what's not working for you.
+LazCraft 1.10 is the rewrite that was called LazCraft2 during testing. It replaces the old LazCraft.
 
-LazCraft is designed to be a one-stop crafting solution on Project Lazarus. It handles purchasing, handing off items, and even instructing casters to make summoned items. On the leveling path, it has pre-designed and suggested recipes — but it's completely configurable, so you can design your own leveling path with just a few seconds of effort.
+## Install / update
 
-The idea behind using LazCraft to level up a tradeskill is that you select a tradeskill and start it up. LazCraft handles all buying of kits (or going to your bank to grab them). It'll put the containers in Slot 10, and move any bags that might be lurking there. And when you're done, a quick button press will throw the containers and trophies back into the bank.
+Use the AdventureTime Patcher: https://github.com/sebbun123/AdventureTimePatcher/releases/latest
 
-## Installation
+Pick **LazCraft**, choose your MacroQuest folder, and click **Update Now**. It installs to
+`<MacroQuest>/lua/lazcraft/`, checks every file against `manifest.txt` before changing anything, keeps a backup of
+what it replaces in `config/LazCraftPatcher_backup/`, and never touches `settings/` or `logs/`.
 
-Download the files. Place `TradeskillListener.lua` into your E3 Lua folder. The remaining files go into your `Lua > LazCraft` folder. If this is your first time using LazCraft, create a new folder and name it `LazCraft`.
+Updating from the old LazCraft: its files that 1.10 no longer uses (the top-level `tradeskills.ini`,
+`merchants.ini`, `research.ini`, `stations.ini`, `fishing.ini`, `TradeskillListener.lua`, `update.bat`) are moved to
+that backup folder.
 
-In-game: type `/lua run Lazcraft` to start the Lua. Enjoy!
+## Running
 
-## Crafting Tab
+- Crafter: `/lua run lazcraft`
+- Worker (another character, working for the crafter): `/lua run lazcraft worker <crafter>`
+- Commands: `/lc show | hide | go | cancel | pause | resume | stop | quit`, `/lc make <combines> <recipe>`,
+  `/lc plan <combines> <recipe>`, `/lc level <skill>` and more - `/lc` alone lists them.
 
-This is where you'll be focused after you've hit 300 on most of the tradeskills. It has a dropdown where you can select a tradeskill and a short selection of items — but you can also search LazCraft's 11k+ recipes. It'll auto-swap your trophies prior to trying a combine, and once you're done with the combine, will replace whatever it's misplaced during the process.
+Every character on the network has to run the same LazCraft version: LazCraft2 and 1.10 do not talk to each other.
 
-## Leveling Tab
+## Files
 
-The Leveling Tab is where you go to level up your tradeskills. You'll get a welcome page when you first start it up. Read it, and after that pick which tradeskill you want to work on. Each tradeskill has a small selection of pre-selected suggested combines. You can remove them, add your own, or just start crafting.
-
-Each recipe is iterative, meaning that if you pick Qty 100, it'll go and buy enough ingredients (or get them from your bots in a safe AFK zone) for 100 combines. If you're still below the trivial, it'll do it again. And again. Once that item is trivial, it'll move to the next and repeat until you're at the max your character can reach for that tradeskill (or the max your selected path can get you).
-
-It'll use Geerloks you have on you, but it won't go searching too hard for them. I don't generally recommend bothering.
-
-## Research
-
-The Research Tab is for crafting spells. It does it very fast. As a note: casters can make spells only, while pure melee can make tomes *and* spells. I'd recommend spending the effort to get a melee up.
-
-## Supply
-
-Supply is how you request your bots to do things. You can ask casters to summon tradeskill items, or request your bots to check their bank for an item. There's a pre-selected list to make this easy — but, like all things LazCraft, you can request anything by typing it into the menu. You can choose a quantity from your bots, or just ask for literally every single one of that item.
-
-## Stats
-
-An easy way to verify your progress in each tradeskill.
-
-## Settings
-
-This contains your character-specific settings. If you're a necro and can't shop in Felwithe, you can skip traveling there and send a bot to do it for you. You can also add illusion items if you think they'll help.
-
-## Travel
-
-These are locations already mapped for traveling to vendor purchases. It's likely not very helpful, but it's there for people who might need to manually do something.
-
-## TradeskillListener.lua
-
-This is the true magic behind LazCraft's requests. It tells your characters what to do with the requests, and it's also behind requesting items from your group members. It's set to time itself out.
+- `settings/LazCraft_<Name>.ini` - each character's settings (the window's Settings tab edits them live)
+- `settings/data_cache.lua` - the recipe data, prepared once for quick starts (safe to delete)
+- `logs/LazCraft_<Name>.log` - every step, for reports
+- `NOTES.md` - how it works and why, rule by rule

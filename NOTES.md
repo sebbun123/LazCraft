@@ -666,6 +666,23 @@ the console shows normal messages. `/lc log debug` shows every step in the conso
 79. 2.46.9 spellbooks (engine/books): a character that does not answer is left out of the scan for the session (2.46.8
     Shela log: Menanu - on DanNet, never answering, likely a client on another machine - asked every 15s all session). A
     recheck asked for by name (a plan short of a summoned item) or Check spellbooks still asks it.
+80. 1.10.1 (2.46.8 and 1.10.0 Vadar logs, Cobalt Plate Gorget Template at Forges):
+    - Failure returns: after a failed combine the cursor must stay empty SALVAGE_MS (now 800, was 300) before the combine
+      is over; each arrival starts it again, FAIL_CAP_MS (4s) in all. The Toluene Coal came 0.55s after the failure
+      message and the Plate Gorget Template Mold at 1.1, 1.7 and 2.0s (the server bouncing it back), each landing while
+      the next combine was placed - then a desync. A success waits nothing more.
+    - Station reopen after /cleanup: the user's question - is it clicked with something on the cursor? - and the log
+      agrees: /cleanup at 172.522, the Forge clicked at 172.670, and 0.25s later the game moved "slot 33" (the cursor) to
+      4417 (pack3 slot 8, the Molds): the SERVER still held the bounced Mold while the client's cursor read empty, and a
+      world container does not open for a click with something on the cursor. Now the reset clicks the station it stands
+      at again, each time after /autoinventory, a pause (Make.REOPEN_WAITS 2s, then 5s), the desync lines waited out and
+      the cursor stowed; only then the other stations and the AFK mirror.
+    - A station that refuses the recipe: a refusal at the same spot again after the full reset leaves that spot out for
+      the session (Make.refusing) and the reset goes to another; every listed one refusing is "busy here", never the
+      nearest-by-name fallback (it finds the same one). containers.ini: the PoK "Forge" at -342.89 755.66 (IT10804) is
+      gone - 9 of 9 refused there, while IT66 at -397.91 434.47 made them.
+    - Snapshots leave out their own lines heard back in chat (indented after [LC]); each one carried every earlier one.
+
 ## Versions
 Releases are 1.xx.x - no beta tag since 1.10.0.
 1.10.0 (2026-10-23): LazCraft2 became LazCraft, out of beta - the next LazCraft, not a product of its own. Everything above marked

@@ -8,7 +8,7 @@ local mq = require('mq')
 local SCRIPT_DIR = (debug.getinfo(1, 'S').source:match('^@?(.*[\\/])')) or ''
 package.path = SCRIPT_DIR .. '?.lua;' .. SCRIPT_DIR .. '?/init.lua;' .. package.path
 
-local VERSION = '1.10.0'
+local VERSION = '1.10.1'
 
 local R      = require('core.result')
 local Log    = require('core.log')

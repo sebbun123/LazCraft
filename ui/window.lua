@@ -863,7 +863,7 @@ function Window:level_tab()
     end
     local stop = false
     self:table('##lc_lvl_rows', { { '#', w = 22 }, { 'Recipe' }, { 'Triv', w = 36 }, { 'Combines', w = 96 }, { 'Then', w = 80 },
-                                    { '', w = 58 }, { '', w = 168 } }, function()
+                                    { '', w = 58 }, { '', w = 180 }, { '', w = 24 } }, function()
         for i, row in ipairs(self.lvlRows[skill]) do
             if stop then return end
             local key = skill .. '_' .. i
@@ -875,7 +875,7 @@ function Window:level_tab()
             if #row.recipes == 0 then
                 ImGui.TextDisabled(row.rung.recipe .. ' - no recipe by that name in the data')
                 if A.levelDrop then
-                    self:cell(); self:cell(); self:cell(); self:cell(); self:cell()
+                    self:cell(); self:cell(); self:cell(); self:cell(); self:cell(); self:cell()
                     if ImGui.Button('X##lc_lv_x_' .. key) then A.levelDrop(skill, row); self.lvlRows[skill] = nil; stop = true; return end
                 end
             else
@@ -943,8 +943,10 @@ function Window:level_tab()
                     ImGui.SameLine()
                     if ImGui.Button('Clean up##lc_lv_cl_' .. key) then A.levelCleanup(skill, r) end
                 end
+                -- X (take the row off) has its own column: after Rep, Make and Clean up it ran past the
+                -- fixed-width action column and was clipped out of sight
+                self:cell()
                 if A.levelDrop then
-                    ImGui.SameLine()
                     if ImGui.Button('X##lc_lv_x_' .. key) then A.levelDrop(skill, row); self.lvlRows[skill] = nil; stop = true; return end
                 end
             end

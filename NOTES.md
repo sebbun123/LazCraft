@@ -675,6 +675,8 @@ Releases are 1.xx.x - no beta tag since 1.10.0.
   LazCraft2 and a 1.10 do not hear each other. The old LazCraft's commands (/ts_*, /laz*, /tsui) do not clash.
 - Files settings/LazCraft_<Name>*.ini, logs/LazCraft_<Name>.log; log tag [LC]. Nothing carried over from LazCraft2's
   files (the user's call: few settings); shared learned files (rates, stacks, unsold) start fresh too.
+1.10.1 (2026-11-22): Leveling tab - a row's X (take it off the path) has its own column again. Since Clean up joined Rep
+  and Make in the fixed 168px action column, X ran past its edge and was clipped out of sight at any window size.
 
 ## Known limits
 - `/e3p off` is sent when a job ends even if you had paused E3 by hand before it started.
